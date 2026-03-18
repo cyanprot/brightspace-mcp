@@ -41,6 +41,19 @@ Before first use, the user must provide:
 
 If the user has used this skill before, check memory for saved course mappings.
 
+## MCP Tools Reference
+
+| Tool | Purpose |
+|------|---------|
+| `get_courses()` | List active courses |
+| `get_course_content(course_id, module_id?)` | List modules/topics in course content |
+| `download_file(course_id, topic_id, save_dir)` | Download a content topic file |
+| `get_assignments(course_id)` | List all dropbox folders (assignments AND labs) |
+| `get_assignment_attachments(course_id, folder_id)` | List files attached to a dropbox folder |
+| `download_assignment_file(course_id, folder_id, file_id, save_dir)` | Download a specific dropbox attachment |
+| `get_grades(course_id)` | Get grade info |
+| `login()` | Authenticate via SSO |
+
 ## Workflow
 
 ### Phase 1: Discover
@@ -62,19 +75,30 @@ For each module returned in Phase 1:
 
 **Optimization**: Scan multiple modules in parallel when there are many.
 
-Result: flat list of all downloadable files with their module context.
+Result: flat list of all downloadable content files with their module context.
+
+### Phase 2B: Scan Assignment/Lab Attachments
+
+1. Call `mcp__brightspace__get_assignments(course_id)` to get all dropbox folders (returns assignments AND labs)
+2. For each dropbox folder (skip if `is_hidden`):
+   - Call `mcp__brightspace__get_assignment_attachments(course_id, folder_id)` to get attached files
+   - Record: `{source: "dropbox", folder_name, folder_id, file_id, filename, size_bytes}`
+3. Merge into the same flat file list from Phase 2 (each entry tagged with `source: "content"` or `source: "dropbox"`)
+
+Result: unified flat list of all remote files (content + dropbox) with source and context.
 
 ### Phase 3: Diff with Local Files
 
 1. Scan the user's local project directory recursively using Glob:
-   - `{root}/**/*.pptx`, `{root}/**/*.pdf`, `{root}/**/*.java`, `{root}/**/*.zip`, `{root}/**/*.docx`, etc.
-   - Cover all subdirectories: lectures/, labs/, assignments/, docs/, etc.
+   - `{root}/lectures/**/*`, `{root}/lectures-pdf/**/*`, `{root}/labs/**/*`
+   - `{root}/assignments/**/*`, `{root}/demo-code/**/*`, `{root}/docs/**/*`
 
 2. Compare remote files with local files by **filename** (case-insensitive):
    - **NEW** = remote filename not found anywhere in local tree
    - **EXISTS** = filename already present locally
+   - For **dropbox-sourced** files, use **folder_name + filename** for comparison (different assignments can have the same filename like `Tester.java`)
 
-3. Display diff as a table:
+3. Display diff as a table (show folder name in Module column for dropbox-sourced files):
 
 ```
 ## Sync Report: {Course Name}
@@ -82,6 +106,7 @@ Result: flat list of all downloadable files with their module context.
 | Status | Module | File | Local Path |
 |--------|--------|------|------------|
 | NEW    | Week05 | Lecture_5_Slides.pptx | — |
+| NEW    | Assignment 3 | Instructions.pdf | — |
 | EXISTS | Week01 | Lecture_1_Slides.pptx | lectures/ |
 
 **{X} new files** to download, {Y} already synced.
@@ -97,25 +122,51 @@ For each NEW file, determine the target directory using routing rules.
 
 These rules work for typical course folder structures. Adapt based on the user's actual directory layout.
 
-| Pattern | Target Directory |
-|---------|-----------------|
-| `*Slides*.pptx` or `*.pptx` | `{root}/lectures/` |
-| `*Slides*.pdf` | `{root}/lectures-pdf/` |
-| `Assignment*.pdf` | `{root}/assignments/` (or subfolder if numbered) |
-| `Lab*.pdf` | `{root}/labs/` |
-| `*DemoCode*.zip` or `*.java` | `{root}/demo-code/` |
-| `*Practice*.docx` or exam-related | `{root}/exam-prep/` |
-| Other | Ask user for target, or save to `{root}/downloads/` |
+| Pattern | Source | Target Directory |
+|---------|--------|-----------------|
+| `*Slides*.pptx` or `*.pptx` | content | `{root}/lectures/` |
+| `*Slides*.pdf` | content | `{root}/lectures-pdf/` |
+| `*DemoCode*.zip` or `*.java` (from Week modules) | content | `{root}/demo-code/` (+ unzip for zips) |
+| `*Practice*.docx` or exam-related | content | `{root}/exam-prep/` |
+| Any file from "Assignment*" dropbox folder | dropbox | `{root}/assignments/{normalized_name}/` |
+| Any file from "Lab*" dropbox folder | dropbox | `{root}/labs/` |
+| Other | -- | Ask user for target, or save to `{root}/downloads/` |
 
 **Adapt these rules** to match the user's actual directory structure. If unsure, ask before downloading.
 
-#### Download Execution
+#### Folder Name Normalization
 
-For each file to download:
+Before routing, normalize Brightspace dropbox folder names to match local convention:
+- Strip leading zeros from numbers: `"Assignment 01"` → `"Assignment 1"`, `"Lab 03"` → `"Lab 3"`
+- Logic: replace each numeric group with its integer value (e.g., `01` → `1`)
+- Apply this normalization in **both Phase 3 (Diff)** and **Phase 4 (Route)** to ensure existing local folders are matched correctly
+
+#### Download Execution — Content Files
+
+For each content-sourced NEW file:
 1. Create target directory if it doesn't exist (`mkdir -p`)
 2. Call `mcp__brightspace__download_file(course_id, topic_id, save_dir=<target>)`
 3. Log: "Downloaded: {filename} -> {target_dir} ({size})"
 4. If download fails, log error and continue with remaining files
+
+#### Zip Auto-Extraction
+
+After downloading zip files to `demo-code/`:
+
+```bash
+unzip -o -d {root}/demo-code/ {root}/demo-code/<new_file>.zip
+```
+
+Remove the zip after successful extraction if desired (or keep for reference).
+
+#### Download Execution — Dropbox Files
+
+For each dropbox-sourced NEW file:
+1. Normalize folder name (strip leading zeros)
+2. Create target directory if it doesn't exist (`mkdir -p`)
+3. Call `mcp__brightspace__download_assignment_file(course_id, folder_id, file_id, save_dir=<target>)`
+4. Log: "Downloaded: {filename} -> {target_dir} ({size})"
+5. If download fails, log error and continue with next file
 
 #### PPTX to PDF Conversion (Optional)
 
@@ -135,13 +186,19 @@ Display final summary:
 ```
 ## Sync Complete: {Course Name}
 
-Downloaded {N} new files:
+### Course Content: {N} new files
 | File | Size | Saved To |
 |------|------|----------|
 | Lecture_5.pptx | 1.3 MB | lectures/ |
-| Lab_05.pdf | 245 KB | labs/ |
 
-PDF conversions: {M} files
+### Assignment/Lab Attachments: {M} new files
+| Folder | File | Size | Saved To |
+|--------|------|------|----------|
+| Assignment 3 | Instructions.pdf | 263 KB | assignments/Assignment 3/ |
+| Lab 05 | Lab05.pdf | 137 KB | labs/ |
+
+PDF conversions: {P} files
+Zip extractions: {Z} files
 Errors: {E} (details if any)
 ```
 
@@ -151,7 +208,11 @@ Errors: {E} (details if any)
 - **Non-destructive**: Never deletes local files, only adds new ones
 - **Auth required**: If session expired, call `mcp__brightspace__login` first
 - **Multi-course**: Can sync all enrolled courses or a specific one
-- **Filename collision**: The MCP download tool auto-appends numeric suffixes for duplicates
+- **Filename collision**: The MCP download tools auto-append numeric suffixes for duplicates
+- **Parallelism**: Phase 2 module scans can be parallelized with multiple Agent calls
+- **Hidden files**: Skip items where `is_hidden == true`
+- **Dropbox folders**: Assignments and labs are dropbox folders. Use `get_assignments` to list them, `get_assignment_attachments` to get attached files.
+- **Lab vs Assignment**: Inferred from folder name (starts with "Lab" → `labs/`, "Assignment" → `assignments/{folder_name}/`)
 
 ## Error Handling
 

@@ -11,7 +11,7 @@ from mcp.server.fastmcp import Context, FastMCP
 from .api import BrightspaceAPI, SessionExpiredError
 from .auth import sso_login, try_restore_session
 from .config import Config
-from .models import Assignment, CalendarEvent, ContentItem, Course, DownloadResult, GradeValue
+from .models import Assignment, CalendarEvent, ContentItem, Course, DownloadResult, DropboxAttachment, GradeValue
 
 # All logging goes to stderr — stdout is reserved for MCP stdio transport
 logging.basicConfig(stream=sys.stderr, level=logging.INFO)
@@ -199,6 +199,56 @@ async def download_file(
     try:
         return await _with_auth_retry(
             app, lambda: app.api.download_topic_file(course_id, topic_id, target_dir)
+        )
+    except Exception as e:
+        return f"Download failed: {e}"
+
+
+@mcp.tool()
+async def get_assignment_attachments(
+    course_id: int, folder_id: int, ctx: Context = None
+) -> list[DropboxAttachment] | str:
+    """List files attached to an assignment/lab dropbox folder.
+
+    Args:
+        course_id: The course org unit ID. Use get_courses to find it.
+        folder_id: The dropbox folder ID. Use get_assignments to find it.
+    """
+    app = _get_app(ctx)
+    if not app.api:
+        return "Not authenticated. Call 'login' first."
+
+    try:
+        return await _with_auth_retry(
+            app, lambda: app.api.get_dropbox_attachments(course_id, folder_id)
+        )
+    except Exception as e:
+        return f"Error fetching attachments: {e}"
+
+
+@mcp.tool()
+async def download_assignment_file(
+    course_id: int, folder_id: int, file_id: int,
+    save_dir: str | None = None, ctx: Context = None
+) -> DownloadResult | str:
+    """Download a file attached to an assignment/lab dropbox folder.
+
+    Args:
+        course_id: The course org unit ID.
+        folder_id: The dropbox folder ID. Use get_assignments to find it.
+        file_id: The file ID from get_assignment_attachments.
+        save_dir: Optional directory to save to. Defaults to ~/.brightspace-mcp/downloads/
+    """
+    app = _get_app(ctx)
+    if not app.api:
+        return "Not authenticated. Call 'login' first."
+
+    target_dir = Path(save_dir) if save_dir else app.config.download_dir
+    await ctx.info(f"Downloading attachment {file_id} to {target_dir}...")
+
+    try:
+        return await _with_auth_retry(
+            app, lambda: app.api.download_dropbox_attachment(course_id, folder_id, file_id, target_dir)
         )
     except Exception as e:
         return f"Download failed: {e}"

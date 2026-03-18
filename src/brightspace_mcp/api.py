@@ -8,7 +8,7 @@ from urllib.parse import unquote
 import httpx
 
 from .config import Config
-from .models import Assignment, CalendarEvent, ContentItem, Course, DownloadResult, GradeValue
+from .models import Assignment, CalendarEvent, ContentItem, Course, DownloadResult, DropboxAttachment, GradeValue
 
 
 class SessionExpiredError(Exception):
@@ -250,6 +250,57 @@ class BrightspaceAPI:
 
         return DownloadResult(
             topic_id=topic_id,
+            filename=filename,
+            save_path=str(path),
+            size_bytes=len(resp.content),
+        )
+
+    async def get_dropbox_attachments(
+        self, course_id: int, folder_id: int
+    ) -> list[DropboxAttachment]:
+        """GET /d2l/api/le/{ver}/{courseId}/dropbox/folders/{folderId} — list folder attachments."""
+        data = await self._get(
+            f"/d2l/api/le/{self.config.le_version}/{course_id}/dropbox/folders/{folder_id}"
+        )
+        attachments = data.get("Attachments", []) if isinstance(data, dict) else []
+        return [
+            DropboxAttachment(
+                file_id=att.get("FileId", 0),
+                folder_id=folder_id,
+                filename=att.get("FileName", ""),
+                size_bytes=att.get("Size", 0),
+            )
+            for att in attachments
+        ]
+
+    async def download_dropbox_attachment(
+        self, course_id: int, folder_id: int, file_id: int, save_dir: Path
+    ) -> DownloadResult:
+        """Download a file attached to a dropbox folder."""
+        resp = await self._get_binary(
+            f"/d2l/api/le/{self.config.le_version}/{course_id}"
+            f"/dropbox/folders/{folder_id}/attachments/{file_id}"
+        )
+
+        cd = resp.headers.get("content-disposition", "")
+        match = re.search(r'filename\*?=["\']?(?:UTF-8\'\')?([^"\';,\r\n]+)', cd)
+        filename = unquote(match.group(1).strip()) if match else f"attachment_{file_id}.bin"
+        filename = re.sub(r'[/<>:"\\|?*\x00]', "_", filename)[:200]
+
+        save_dir.mkdir(parents=True, exist_ok=True)
+        path = save_dir / filename
+
+        if path.exists():
+            stem, suffix = path.stem, path.suffix
+            n = 1
+            while path.exists():
+                path = save_dir / f"{stem} ({n}){suffix}"
+                n += 1
+
+        path.write_bytes(resp.content)
+
+        return DownloadResult(
+            topic_id=file_id,
             filename=filename,
             save_path=str(path),
             size_bytes=len(resp.content),

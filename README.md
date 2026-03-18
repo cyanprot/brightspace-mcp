@@ -23,9 +23,11 @@ Claude Code  --stdio-->  MCP Server  --httpx-->  D2L Brightspace REST API
 | `login` | Authenticate via Office365 SSO (opens browser, supports MFA) |
 | `get_courses` | List all enrolled courses |
 | `get_assignments` | Get assignments with due dates and instructions |
+| `get_assignment_attachments` | List files attached to an assignment/lab dropbox folder |
 | `get_calendar` | Upcoming events and deadlines across all courses |
 | `get_course_content` | Browse course content tree (modules, files, links) |
-| `download_file` | Download a file to your local filesystem |
+| `download_file` | Download a content file to your local filesystem |
+| `download_assignment_file` | Download a file from an assignment/lab dropbox folder |
 | `get_grades` | View your grades for a course |
 
 ## Setup
@@ -96,10 +98,10 @@ Just tell Claude:
 - "download new lecture slides"
 
 The skill will:
-1. Scan Brightspace for all course files
+1. Scan Brightspace for all course files **and assignment/lab attachments**
 2. Compare with your local folders
 3. Show you what's new
-4. Download and organize new files automatically
+4. Download and organize new files automatically (with folder name normalization)
 5. Optionally convert PPTX slides to PDF
 
 ## Configuration Reference

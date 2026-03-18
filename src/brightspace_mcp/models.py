@@ -47,6 +47,13 @@ class DownloadResult(BaseModel):
     size_bytes: int
 
 
+class DropboxAttachment(BaseModel):
+    file_id: int
+    folder_id: int
+    filename: str
+    size_bytes: int
+
+
 class GradeValue(BaseModel):
     grade_item_id: str
     name: str
