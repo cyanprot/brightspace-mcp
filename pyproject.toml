@@ -1,0 +1,20 @@
+[project]
+name = "brightspace-mcp"
+version = "0.1.0"
+description = "MCP server for D2L Brightspace LMS — access courses, assignments, grades, and content from Claude Code"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "mcp>=1.26.0",
+    "playwright>=1.52",
+    "pydantic>=2.12",
+    "httpx>=0.28",
+    "python-dotenv>=1.0",
+]
+
+[project.scripts]
+brightspace-mcp = "brightspace_mcp.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
