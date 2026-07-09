@@ -17,7 +17,9 @@ class Config:
         self.username: str = os.environ.get("BRIGHTSPACE_USER", "")
         self.password: str = os.environ.get("BRIGHTSPACE_PASS", "")
         self.session_dir: Path = Path(
-            os.environ.get("BRIGHTSPACE_SESSION_DIR", Path.home() / ".brightspace-mcp")
+            os.environ.get(
+                "BRIGHTSPACE_SESSION_DIR", Path.home() / ".local/state/brightspace-mcp"
+            )
         )
         self.headless: bool = os.environ.get("BRIGHTSPACE_HEADLESS", "false").lower() == "true"
         self.lp_version: str = "1.57"

@@ -74,7 +74,7 @@ The first time you use any tool, you'll need to authenticate:
 1. Claude will call the `login` tool
 2. A browser window opens with your school's Office365 login
 3. Enter your credentials and complete MFA if prompted
-4. Session cookies are saved to `~/.brightspace-mcp/` for future use
+4. Session cookies are saved to `~/.local/state/brightspace-mcp/` for future use
 
 Sessions typically last 1-4 hours. The server auto-restores saved sessions on startup and warns when cookies are aging.
 
@@ -112,12 +112,12 @@ The skill will:
 | `BRIGHTSPACE_USER` | — | Login email |
 | `BRIGHTSPACE_PASS` | — | Login password |
 | `BRIGHTSPACE_HEADLESS` | `false` | Set `true` to hide the login browser |
-| `BRIGHTSPACE_SESSION_DIR` | `~/.brightspace-mcp/` | Where cookies and session data are stored |
-| `BRIGHTSPACE_DOWNLOAD_DIR` | `~/.brightspace-mcp/downloads/` | Default download location |
+| `BRIGHTSPACE_SESSION_DIR` | `~/.local/state/brightspace-mcp/` | Where cookies and session data are stored |
+| `BRIGHTSPACE_DOWNLOAD_DIR` | `~/.local/state/brightspace-mcp/downloads/` | Default download location |
 
 ## Session Management
 
-- Cookies are saved to `~/.brightspace-mcp/storage_state.json`
+- Cookies are saved to `~/.local/state/brightspace-mcp/storage_state.json`
 - Sessions auto-restore on server startup
 - If a session expires mid-use, tools automatically attempt to restore from saved cookies
 - If restore fails, you'll see "Session expired. Call 'login' to re-authenticate."

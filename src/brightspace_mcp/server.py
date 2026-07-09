@@ -187,7 +187,7 @@ async def download_file(
     Args:
         course_id: The course org unit ID.
         topic_id: The topic ID of the file to download. Must be a file-type topic.
-        save_dir: Optional directory to save to. Defaults to ~/.brightspace-mcp/downloads/
+        save_dir: Optional directory to save to. Defaults to ~/.local/state/brightspace-mcp/downloads/
     """
     app = _get_app(ctx)
     if not app.api:
@@ -237,7 +237,7 @@ async def download_assignment_file(
         course_id: The course org unit ID.
         folder_id: The dropbox folder ID. Use get_assignments to find it.
         file_id: The file ID from get_assignment_attachments.
-        save_dir: Optional directory to save to. Defaults to ~/.brightspace-mcp/downloads/
+        save_dir: Optional directory to save to. Defaults to ~/.local/state/brightspace-mcp/downloads/
     """
     app = _get_app(ctx)
     if not app.api:
