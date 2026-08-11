@@ -12,8 +12,14 @@ dependencies = [
     "python-dotenv>=1.0",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+]
+
 [project.scripts]
 brightspace-mcp = "brightspace_mcp.server:main"
+brightspace-mcp-login = "brightspace_mcp.auth:login_cli"
 
 [build-system]
 requires = ["hatchling"]

@@ -9,10 +9,14 @@ Includes a **sync skill** that automatically detects and downloads new course ma
 ```
 Claude Code  --stdio-->  MCP Server  --httpx-->  D2L Brightspace REST API
                               |
-                        Playwright  -->  Office365 SSO (login only)
+                        Playwright  -->  persistent Chromium profile
+                                         (holds the Office365 SSO session)
 ```
 
-- **Login**: Playwright opens a browser for Office365 SSO (supports MFA). Cookies are saved for reuse.
+- **Login**: Playwright opens a persistent Chromium profile that already holds
+  the Office365 SSO session and re-authenticates silently. No password is
+  stored or typed and no MFA prompt appears. The profile is seeded once by
+  hand (see First Login); cookies are saved for reuse.
 - **API calls**: All data fetching uses the D2L Valence REST API via `httpx` with session cookies.
 - **No admin access needed**: Works with regular student/instructor accounts.
 
@@ -20,7 +24,7 @@ Claude Code  --stdio-->  MCP Server  --httpx-->  D2L Brightspace REST API
 
 | Tool | Description |
 |------|-------------|
-| `login` | Authenticate via Office365 SSO (opens browser, supports MFA) |
+| `login` | Silent SSO refresh from the persistent browser profile (no credentials, no MFA) |
 | `get_courses` | List all enrolled courses |
 | `get_assignments` | Get assignments with due dates and instructions |
 | `get_assignment_attachments` | List files attached to an assignment/lab dropbox folder |
@@ -54,8 +58,10 @@ Create a `.env` file in the project root:
 ```env
 BRIGHTSPACE_URL=https://your-school.brightspace.com
 BRIGHTSPACE_USER=your-email@school.edu
-BRIGHTSPACE_PASS=your-password
 ```
+
+No password goes here. The Microsoft SSO session lives in a persistent
+Chromium profile that you seed once by hand (see First Login).
 
 ### Register with Claude Code
 
@@ -63,20 +69,30 @@ BRIGHTSPACE_PASS=your-password
 claude mcp add -s user --transport stdio \
   -e BRIGHTSPACE_URL=https://your-school.brightspace.com \
   -e BRIGHTSPACE_USER=your-email@school.edu \
-  -e BRIGHTSPACE_PASS=your-password \
-  brightspace -- uv run --directory /path/to/brightspace-mcp brightspace-mcp
+  brightspace -- xvfb-run -a uv run --directory /path/to/brightspace-mcp brightspace-mcp
 ```
+
+`BRIGHTSPACE_HEADLESS` defaults to `false`, so the silent refresh still needs a
+display. `xvfb-run -a` supplies a virtual one, as in the registration above.
+Keep the headful
+default: in headless mode Chromium skips the ProcessSingleton profile lock, and
+two processes can then write the same profile at once.
 
 ### First Login
 
-The first time you use any tool, you'll need to authenticate:
+Seed the browser profile once, by hand, from a real desktop session:
 
-1. Claude will call the `login` tool
-2. A browser window opens with your school's Office365 login
-3. Enter your credentials and complete MFA if prompted
-4. Session cookies are saved to `~/.local/state/brightspace-mcp/` for future use
+```bash
+uv run --directory /path/to/brightspace-mcp brightspace-mcp-login
+```
 
-Sessions typically last 1-4 hours. The server auto-restores saved sessions on startup and warns when cookies are aging.
+A visible Chromium window opens on your school's Office365 login. Enter your
+password, approve MFA, and answer **Yes** to "Stay signed in?" — that answer is
+what makes every later login unattended.
+
+After that, the `login` tool re-authenticates **silently** from the profile: no
+password is stored or typed, and no MFA prompt appears. Rerun the command above
+only when `login` tells you the profile's SSO session has died.
 
 ## Sync Skill
 
@@ -84,11 +100,17 @@ The `skill/` directory contains a Claude Code skill for **automatic course mater
 
 ### Install the Skill
 
-Copy the skill to your Claude Code skills directory:
+Copy the skill's contents to your Claude Code skills directory:
 
 ```bash
-cp -r skill/ ~/.claude/skills/brightspace-sync/
+mkdir -p ~/.claude/skills/brightspace-sync
+cp skill/SKILL.md ~/.claude/skills/brightspace-sync/
 ```
+
+Copy the *contents*, not the `skill/` directory itself, or you get a nested
+`skill/` inside the target. If that target is a symlink into another repo, the
+file behind the symlink is the copy Claude Code loads, and the copy in `skill/`
+can lag behind it.
 
 ### Usage
 
@@ -109,19 +131,35 @@ The skill will:
 | Environment Variable | Default | Description |
 |---------------------|---------|-------------|
 | `BRIGHTSPACE_URL` | `https://d2l.langara.bc.ca` | Your school's Brightspace URL |
-| `BRIGHTSPACE_USER` | — | Login email |
-| `BRIGHTSPACE_PASS` | — | Login password |
-| `BRIGHTSPACE_HEADLESS` | `false` | Set `true` to hide the login browser |
-| `BRIGHTSPACE_SESSION_DIR` | `~/.local/state/brightspace-mcp/` | Where cookies and session data are stored |
+| `BRIGHTSPACE_USER` | — | Login email. Only prefills the sign-in box during the manual bootstrap |
+| `BRIGHTSPACE_HEADLESS` | `false` | Set `true` to hide the browser during the silent refresh |
+| `BRIGHTSPACE_SESSION_DIR` | `~/.local/state/brightspace-mcp/` | Cookies, downloads, and the persistent browser profile |
 | `BRIGHTSPACE_DOWNLOAD_DIR` | `~/.local/state/brightspace-mcp/downloads/` | Default download location |
 
 ## Session Management
 
-- Cookies are saved to `~/.local/state/brightspace-mcp/storage_state.json`
+- The Microsoft SSO session lives in the persistent Chromium profile at
+  `~/.local/state/brightspace-mcp/chrome-profile/`. **Treat that directory as a
+  credential** — never copy it between machines, never commit it
+- Brightspace cookies are saved to `~/.local/state/brightspace-mcp/storage_state.json`
 - Sessions auto-restore on server startup
 - If a session expires mid-use, tools automatically attempt to restore from saved cookies
 - If restore fails, you'll see "Session expired. Call 'login' to re-authenticate."
+- `login` refreshes from the profile without credentials. If the profile itself
+  has no session left it returns the `brightspace-mcp-login` bootstrap
+  instructions instead of hanging on a login form nobody can see
 - Cookie age warning appears when session is >2.5 hours old
+
+### Known limitation: the mid-call retry cannot self-heal
+
+`_with_auth_retry` catches `SessionExpiredError` and retries once via
+`try_restore_session`, which re-reads the same `storage_state.json` the dead
+cookies came from. Absent a concurrent writer it returns identical stale
+cookies and fails again, costing one wasted round trip. The failure is loud
+(`"Session expired. Call 'login' to re-authenticate."`), so this is a missed
+opportunity rather than a hazard. Now that `sso_login()` is unattended and
+takes about 2 seconds, calling it here instead would make the retry actually
+recover. Deliberately not changed on 2026-08-11: it alters runtime behaviour.
 
 ## Compatibility
 

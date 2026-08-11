@@ -21,7 +21,7 @@ Sync course materials from D2L Brightspace to local project folders.
 ## Prerequisites
 
 - **Brightspace MCP server** must be running and authenticated
-- If tools return "Not authenticated", call `mcp__brightspace__login` first
+- If tools return "Not authenticated", call `mcp__brightspace__login` first. That refresh is silent (persistent browser profile, no credentials, no MFA)
 
 ## Configuration
 
@@ -52,7 +52,7 @@ If the user has used this skill before, check memory for saved course mappings.
 | `get_assignment_attachments(course_id, folder_id)` | List files attached to a dropbox folder |
 | `download_assignment_file(course_id, folder_id, file_id, save_dir)` | Download a specific dropbox attachment |
 | `get_grades(course_id)` | Get grade info |
-| `login()` | Authenticate via SSO |
+| `login()` | Silent SSO refresh from the browser profile |
 
 ## Workflow
 
@@ -206,7 +206,7 @@ Errors: {E} (details if any)
 
 - **Idempotent**: Running sync twice won't re-download existing files
 - **Non-destructive**: Never deletes local files, only adds new ones
-- **Auth required**: If session expired, call `mcp__brightspace__login` first
+- **Auth required**: If session expired, call `mcp__brightspace__login` first. It only needs the user when the browser profile's own SSO session has died
 - **Multi-course**: Can sync all enrolled courses or a specific one
 - **Filename collision**: The MCP download tools auto-append numeric suffixes for duplicates
 - **Parallelism**: Phase 2 module scans can be parallelized with multiple Agent calls
@@ -219,6 +219,7 @@ Errors: {E} (details if any)
 | Error | Action |
 |-------|--------|
 | "Not authenticated" / "Session expired" | Call `mcp__brightspace__login`, then retry |
+| `login` returns bootstrap instructions | The browser profile's SSO session is gone. Hand the user `uv run --directory /path/to/brightspace-mcp brightspace-mcp-login` — it needs a desktop session and a human for MFA. Do not run it under `xvfb-run` |
 | Download fails for specific file | Log warning, continue with remaining files |
 | LibreOffice not found | Skip PDF conversion, warn user |
 | Unknown file type / no routing rule | Ask user where to save, or use `downloads/` |

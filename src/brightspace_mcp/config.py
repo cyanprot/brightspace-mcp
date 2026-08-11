@@ -15,7 +15,6 @@ class Config:
             "BRIGHTSPACE_URL", "https://d2l.langara.bc.ca"
         ).rstrip("/")
         self.username: str = os.environ.get("BRIGHTSPACE_USER", "")
-        self.password: str = os.environ.get("BRIGHTSPACE_PASS", "")
         self.session_dir: Path = Path(
             os.environ.get(
                 "BRIGHTSPACE_SESSION_DIR", Path.home() / ".local/state/brightspace-mcp"
@@ -35,14 +34,18 @@ class Config:
         return self.session_dir / "storage_state.json"
 
     @property
+    def profile_dir(self) -> Path:
+        """Persistent Chromium profile holding the Microsoft SSO session."""
+        return self.session_dir / "chrome-profile"
+
+    @property
     def cookie_age_seconds(self) -> float | None:
         """Seconds since cookies were last saved. None if no saved state."""
         if not self.storage_state_path.exists():
             return None
         return time.time() - self.storage_state_path.stat().st_mtime
 
-    # Standard Microsoft AAD login selectors (stable across tenants)
+    # Microsoft AAD sign-in. Only used to prefill the email during the manual
+    # bootstrap and to tell "still on the AAD page" from "landed on Brightspace".
+    MS_LOGIN_HOST = "login.microsoftonline.com"
     MS_EMAIL_INPUT = 'input[type="email"][name="loginfmt"]'
-    MS_PASSWORD_INPUT = 'input[type="password"][name="passwd"]'
-    MS_SUBMIT_BUTTON = "input[type='submit']#idSIButton9"
-    MS_STAY_SIGNED_IN_NO = "input[type='button']#idBtn_Back"

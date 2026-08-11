@@ -9,7 +9,7 @@ from typing import Any
 from mcp.server.fastmcp import Context, FastMCP
 
 from .api import BrightspaceAPI, SessionExpiredError
-from .auth import sso_login, try_restore_session
+from .auth import LoginRequiredError, sso_login, try_restore_session
 from .config import Config
 from .models import Assignment, CalendarEvent, ContentItem, Course, DownloadResult, DropboxAttachment, GradeValue
 
@@ -89,15 +89,19 @@ async def _with_auth_retry(
 
 @mcp.tool()
 async def login(ctx: Context) -> str:
-    """Authenticate to Langara Brightspace via Office365 SSO.
+    """Refresh the Langara Brightspace session from the saved browser profile.
 
-    Opens a browser for login. Call this before using other tools
-    if you get an authentication error.
+    Silent — no credentials, no MFA. Call this before using other tools if you
+    get an authentication error. If the profile's SSO session is gone, this
+    returns instructions for the one-time manual re-login the user must run.
     """
     app = _get_app(ctx)
 
-    await ctx.info("Starting Brightspace SSO login...")
-    cookies = await sso_login(app.config)
+    await ctx.info("Refreshing Brightspace session...")
+    try:
+        cookies = await sso_login(app.config)
+    except LoginRequiredError as e:
+        return str(e)
 
     app.api = BrightspaceAPI(app.config, cookies)
     user = await app.api.whoami()
