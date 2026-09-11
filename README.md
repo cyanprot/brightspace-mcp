@@ -33,6 +33,11 @@ Claude Code  --stdio-->  MCP Server  --httpx-->  D2L Brightspace REST API
 | `download_file` | Download a content file to your local filesystem |
 | `download_assignment_file` | Download a file from an assignment/lab dropbox folder |
 | `get_grades` | View your grades for a course |
+| `get_course_overview` | Content tool Overview: text, links, attachment. Outlines often live here, outside the content tree |
+| `download_course_overview` | Download the Overview attachment |
+| `download_linked_file` | Download a Brightspace file linked from inside an HTML page (same host only) |
+| `download_announcement_file` | Download a file attached to an announcement |
+| `audit_course` | Read every student-visible source of a course and report status per source, outline candidates, AI-policy mentions, due items, content not yet released, documents missing locally (with the download call for each), remote files changed after the local copy, and Brightspace links it did not follow. Unreadable sources are reported as UNKNOWN, never as empty. An expired session (D2L answers 403, not 401) is reported as expired, never as an empty course |
 
 ## Setup
 

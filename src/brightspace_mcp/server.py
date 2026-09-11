@@ -9,6 +9,8 @@ from typing import Any
 from mcp.server.fastmcp import Context, FastMCP
 
 from .api import BrightspaceAPI, SessionExpiredError
+from .audit import audit_course as run_audit
+from .audit import parse_html, render, strip_query
 from .auth import LoginRequiredError, sso_login, try_restore_session
 from .config import Config
 from .models import Assignment, CalendarEvent, ContentItem, Course, DownloadResult, DropboxAttachment, GradeValue
@@ -66,7 +68,11 @@ def _get_app(ctx: Context) -> AppContext:
 async def _with_auth_retry(
     app: AppContext, func: Callable[[], Coroutine[Any, Any, Any]]
 ) -> Any:
-    """Run func(), retry once with session restore on 401."""
+    """Run func(), retry once with session restore when the session has expired.
+
+    Every failure path returns a string that says "Session expired" and names
+    'login', so a caller never mistakes an auth failure for missing data.
+    """
     try:
         return await func()
     except SessionExpiredError:
@@ -84,7 +90,12 @@ async def _with_auth_retry(
             await app.api.close()
         app.api = new_api
         logger.info("Session restored successfully")
+    try:
         return await func()
+    except SessionExpiredError:
+        app.api = None
+        return ("Session expired again right after a restore. Call 'login' to "
+                "re-authenticate. Nothing was read, so nothing may be recorded as empty.")
 
 
 @mcp.tool()
@@ -259,6 +270,34 @@ async def download_assignment_file(
 
 
 @mcp.tool()
+async def download_announcement_file(
+    course_id: int, news_id: int, file_id: int,
+    save_dir: str | None = None, ctx: Context = None
+) -> DownloadResult | str:
+    """Download a file attached to an announcement.
+
+    audit_course lists announcement attachments with the news_id and file_id to pass.
+
+    Args:
+        course_id: The course org unit ID.
+        news_id: The announcement ID.
+        file_id: The attachment's file ID.
+        save_dir: Optional directory to save to. Defaults to ~/.local/state/brightspace-mcp/downloads/
+    """
+    app = _get_app(ctx)
+    if not app.api:
+        return "Not authenticated. Call 'login' first."
+
+    target_dir = Path(save_dir) if save_dir else app.config.download_dir
+    try:
+        return await _with_auth_retry(
+            app, lambda: app.api.download_news_attachment(course_id, news_id, file_id, target_dir)
+        )
+    except Exception as e:
+        return f"Download failed: {e}"
+
+
+@mcp.tool()
 async def get_grades(course_id: int, ctx: Context = None) -> list[GradeValue] | str:
     """Get your grades for a specific course.
 
@@ -278,6 +317,134 @@ async def get_grades(course_id: int, ctx: Context = None) -> list[GradeValue] | 
         return await _with_auth_retry(app, _fetch)
     except Exception as e:
         return f"Error fetching grades: {e}"
+
+
+@mcp.tool()
+async def get_course_overview(course_id: int, ctx: Context = None) -> dict | str:
+    """Read the Content tool's Overview page: its text, links and attachment.
+
+    Instructors often attach the course outline here. The Overview is NOT part of
+    the content tree, so get_course_content never shows it.
+
+    Args:
+        course_id: The course org unit ID. Use get_courses to find it.
+    """
+    app = _get_app(ctx)
+    if not app.api:
+        return "Not authenticated. Call 'login' first."
+
+    async def _fetch():
+        ov = await app.api.get_overview(course_id)
+        if ov is None:
+            return {"has_overview": False}
+        html = (ov.get("Description") or {}).get("Html", "")
+        links, text = parse_html(html)
+        attachment = None
+        if ov.get("HasAttachment"):
+            code, name, size = await app.api.overview_attachment_info(course_id)
+            attachment = (
+                {"filename": name, "size_bytes": size} if code == 200
+                else {"status": f"attachment present, unreadable (HTTP {code})"}
+            )
+        return {
+            "has_overview": True,
+            "text": text,
+            "links": [{"text": t, "href": strip_query(h)} for h, t in links],
+            "attachment": attachment,
+        }
+
+    try:
+        return await _with_auth_retry(app, _fetch)
+    except Exception as e:
+        return f"Error fetching overview: {e}"
+
+
+@mcp.tool()
+async def download_course_overview(
+    course_id: int, save_dir: str | None = None, ctx: Context = None
+) -> DownloadResult | str:
+    """Download the file attached to the Content tool's Overview (usually the outline).
+
+    Args:
+        course_id: The course org unit ID.
+        save_dir: Optional directory to save to. Defaults to ~/.local/state/brightspace-mcp/downloads/
+    """
+    app = _get_app(ctx)
+    if not app.api:
+        return "Not authenticated. Call 'login' first."
+
+    target_dir = Path(save_dir) if save_dir else app.config.download_dir
+    try:
+        return await _with_auth_retry(
+            app, lambda: app.api.download_overview_attachment(course_id, target_dir)
+        )
+    except Exception as e:
+        return f"Download failed: {e}"
+
+
+@mcp.tool()
+async def download_linked_file(
+    url: str, save_dir: str | None = None, ctx: Context = None
+) -> DownloadResult | str:
+    """Download a course file that is linked from inside an HTML page, not a topic itself.
+
+    audit_course lists these under "Documents not present locally" with the url to pass.
+    Only Brightspace paths are accepted, because the session cookies go with the request.
+
+    Args:
+        url: A Brightspace path such as /content/enforced/.../file.pdf, or a full URL on
+            the Brightspace host.
+        save_dir: Optional directory to save to. Defaults to ~/.local/state/brightspace-mcp/downloads/
+    """
+    app = _get_app(ctx)
+    if not app.api:
+        return "Not authenticated. Call 'login' first."
+
+    target_dir = Path(save_dir) if save_dir else app.config.download_dir
+    try:
+        return await _with_auth_retry(app, lambda: app.api.download_linked_file(url, target_dir))
+    except Exception as e:
+        return f"Download failed: {e}"
+
+@mcp.tool()
+async def audit_course(
+    course_id: int, local_root: str | None = None, ctx: Context = None
+) -> str:
+    """Audit every student-visible source of a course and report what was checked.
+
+    Reads the Overview, the whole module structure (including topics not yet released)
+    and every HTML page in it, announcements, dropbox folders, quizzes, the gradebook
+    setup, the course calendar, discussions, checklists, the classlist (staff only)
+    and the course home navbar. Returns a markdown report with a status per source,
+    navbar tools it could not read, course outline candidates, AI-policy mentions, due
+    items in local time, content not yet released, calendar-only events, documents
+    missing locally (with the download call for each), remote files changed after the
+    local copy, Brightspace links it did not follow, and links out.
+
+    A source that errors is reported as UNKNOWN, never as empty. Run this before
+    recording anything about a course as "not posted" or "not declared".
+
+    Args:
+        course_id: The course org unit ID. Use get_courses to find it.
+        local_root: Optional local course directory. Documents are compared against it
+            by filename, skipping `_*` (frozen previous-term) and `.*` directories.
+    """
+    app = _get_app(ctx)
+    if not app.api:
+        return "Not authenticated. Call 'login' first."
+
+    async def _fetch():
+        courses = await app.api.get_enrollments()
+        course_name = next((c.name for c in courses if c.id == course_id), "")
+        report = await run_audit(
+            app.api, course_id, course_name, Path(local_root) if local_root else None
+        )
+        return render(report)
+
+    try:
+        return await _with_auth_retry(app, _fetch)
+    except Exception as e:
+        return f"Audit failed: {e}"
 
 
 def main() -> None:
