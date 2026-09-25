@@ -22,22 +22,35 @@ Claude Code  --stdio-->  MCP Server  --httpx-->  D2L Brightspace REST API
 
 ## Tools
 
-| Tool | Description |
-|------|-------------|
-| `login` | Silent SSO refresh from the persistent browser profile (no credentials, no MFA) |
-| `get_courses` | List all enrolled courses |
-| `get_assignments` | Get assignments with due dates and instructions |
-| `get_assignment_attachments` | List files attached to an assignment/lab dropbox folder |
-| `get_calendar` | Upcoming events and deadlines across all courses |
-| `get_course_content` | Browse course content tree (modules, files, links) |
-| `download_file` | Download a content file to your local filesystem |
-| `download_assignment_file` | Download a file from an assignment/lab dropbox folder |
-| `get_grades` | View your grades for a course |
-| `get_course_overview` | Content tool Overview: text, links, attachment. Outlines often live here, outside the content tree |
-| `download_course_overview` | Download the Overview attachment |
-| `download_linked_file` | Download a Brightspace file linked from inside an HTML page (same host only) |
-| `download_announcement_file` | Download a file attached to an announcement |
-| `audit_course` | Read every student-visible source of a course and report status per source, outline candidates, AI-policy mentions, due items, content not yet released, documents missing locally (with the download call for each), remote files changed after the local copy, and Brightspace links it did not follow. Unreadable sources are reported as UNKNOWN, never as empty. An expired session (D2L answers 403, not 401) is reported as expired, never as an empty course |
+14 tools, in the order they're defined in `server.py`:
+
+| Tool | Description | Parameters |
+|------|-------------|------------|
+| `login` | Silent SSO refresh from the persistent browser profile (no credentials, no MFA) | — |
+| `get_courses` | List all enrolled courses | — |
+| `get_assignments` | List assignment/lab dropbox folders for a course, with due dates and instructions | `course_id` |
+| `get_calendar` | Upcoming due dates and events across all active courses | `days` (default 14) |
+| `get_course_content` | Browse the content tree: modules and topics at a given level | `course_id`, `module_id` (optional, omit for root) |
+| `download_file` | Download a content topic file to the local filesystem | `course_id`, `topic_id`, `save_dir` (optional) |
+| `get_assignment_attachments` | List files and links attached to an assignment/lab dropbox folder. A handout attached as a link (not a file) comes back with `file_id` 0 and a `link_url`; fetch that with `download_linked_file`, not `download_assignment_file` | `course_id`, `folder_id` |
+| `download_assignment_file` | Download a file attached to an assignment/lab dropbox folder | `course_id`, `folder_id`, `file_id`, `save_dir` (optional) |
+| `download_announcement_file` | Download a file attached to an announcement | `course_id`, `news_id`, `file_id`, `save_dir` (optional) |
+| `get_grades` | View your own grade values for a course | `course_id` |
+| `get_course_overview` | Read the Content tool's Overview page: text, links and attachment info. The Overview is not part of the content tree, so outlines attached here never show up in `get_course_content` | `course_id` |
+| `download_course_overview` | Download the file attached to the Content tool's Overview (often the course outline) | `course_id`, `save_dir` (optional) |
+| `download_linked_file` | Download a Brightspace file linked from inside an HTML page. Same host only — the session cookies ride on the request | `url`, `save_dir` (optional) |
+| `audit_course` | Read every student-visible source of a course (Overview, full module tree including unreleased topics, every HTML page in it, announcements, dropbox folders, quizzes, gradebook setup, calendar, discussions, checklists, staff-only classlist, course home navbar) and report, per source: status (ok/empty/**UNKNOWN**), course outline candidates, AI-policy mentions, due items, content not yet released, documents missing locally with the exact download call for each, files skipped because they're listed in the local `.syncignore`, closed topics past their end date (403, not counted as missing), remote files that changed after the local copy, and same-host links it did not follow. A source that errors is reported as UNKNOWN, never as empty | `course_id`, `local_root` (optional local course directory to diff against) |
+
+Every download tool refuses to overwrite an existing file: a name collision is saved as
+`X (1).ext`, `X (2).ext`, etc., and the returned `filename`/`save_path` is the name actually
+written — always check it rather than assuming the requested name landed.
+
+Every tool that calls the D2L API treats an expired session as expiry, not as empty data:
+D2L answers an expired session with 403 (rarely 401), or with a redirect back to the login
+page that arrives as a 200 HTML page after following redirects. Either one raises internally
+and triggers one retry from saved cookies before a tool gives up with `"Session expired. Call
+'login' to re-authenticate."` — never with an empty list that looks like a course with nothing
+in it.
 
 ## Setup
 
@@ -125,11 +138,15 @@ Just tell Claude:
 - "download new lecture slides"
 
 The skill will:
-1. Scan Brightspace for all course files **and assignment/lab attachments**
-2. Compare with your local folders
-3. Show you what's new
-4. Download and organize new files automatically (with folder name normalization)
-5. Optionally convert PPTX slides to PDF
+1. Run `audit_course` first (and again after downloading) — a plain file sync misses
+   outlines buried in the Content tool's Overview or linked from inside HTML pages,
+   gradebook weights, and quiz due times, so the audit is what proves the sync actually
+   complete
+2. Scan Brightspace for all course files **and assignment/lab attachments**
+3. Compare with your local folders (never re-downloading anything listed in `.syncignore`)
+4. Show you what's new
+5. Download and organize new files automatically (with folder name normalization)
+6. Optionally convert PPTX slides to PDF, and HTML content pages to PDF
 
 ## Configuration Reference
 
@@ -140,6 +157,7 @@ The skill will:
 | `BRIGHTSPACE_HEADLESS` | `false` | Set `true` to hide the browser during the silent refresh |
 | `BRIGHTSPACE_SESSION_DIR` | `~/.local/state/brightspace-mcp/` | Cookies, downloads, and the persistent browser profile |
 | `BRIGHTSPACE_DOWNLOAD_DIR` | `~/.local/state/brightspace-mcp/downloads/` | Default download location |
+| `BRIGHTSPACE_TZ` | `America/Vancouver` | IANA timezone `audit_course` uses to render due dates and timestamps in local time |
 
 ## Session Management
 
@@ -174,6 +192,18 @@ Tested with:
 - Python 3.14, but should work with 3.12+
 
 The server uses standard D2L Valence REST API endpoints. It should work with any Brightspace instance that exposes these APIs, though the SSO login flow is specific to Microsoft Office365.
+
+## Testing
+
+```bash
+uv run pytest
+```
+
+The suite (`tests/test_api.py`, `tests/test_audit.py`, `tests/test_auth.py`,
+`tests/test_server.py`) covers the API client's pagination, redirect/403 session-expiry
+detection, and no-overwrite download naming; the audit report builder; the persistent-profile
+login flow; and the MCP tool wrappers. It runs offline against fakes/mocks — no live
+Brightspace session or network access is required.
 
 ## License
 
