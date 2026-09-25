@@ -11,9 +11,12 @@ class Config:
     """Brightspace MCP server configuration loaded from environment variables."""
 
     def __init__(self) -> None:
-        self.brightspace_url: str = os.environ.get(
-            "BRIGHTSPACE_URL", "https://d2l.langara.bc.ca"
-        ).rstrip("/")
+        self.brightspace_url: str = os.environ.get("BRIGHTSPACE_URL", "").strip().rstrip("/")
+        if not self.brightspace_url:
+            raise ValueError(
+                "BRIGHTSPACE_URL is not set. Set it to your school's Brightspace URL, "
+                "e.g. https://your-school.brightspace.com"
+            )
         self.username: str = os.environ.get("BRIGHTSPACE_USER", "")
         self.session_dir: Path = Path(
             os.environ.get(

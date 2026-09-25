@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+import brightspace_mcp.audit as audit_mod
 from brightspace_mcp.api import BrightspaceAPI
 from brightspace_mcp.audit import (
     ai_mentions,
@@ -104,6 +105,32 @@ def test_local_index_walks_current_term_handouts(tmp_path: Path):
     assert index["y.java"][0].parts == (("handout",), ("demo", "code"))
     assert local_index(tmp_path / "missing") is None
     assert local_index(None) is None
+
+
+@pytest.fixture(autouse=True)
+def _pacific_zone(monkeypatch):
+    """The expected strings below are Pacific wall-clock times; pin the zone so the
+    suite does not depend on the machine's own zone."""
+    monkeypatch.setattr(audit_mod, "LOCAL_TZ", ZoneInfo("America/Vancouver"))
+
+
+def test_local_zone_prefers_brightspace_tz(monkeypatch):
+    monkeypatch.setenv("BRIGHTSPACE_TZ", "Europe/Berlin")
+    monkeypatch.setenv("TZ", "Asia/Tokyo")
+    assert audit_mod.local_zone().key == "Europe/Berlin"
+
+
+def test_local_zone_falls_back_past_bad_names(monkeypatch):
+    monkeypatch.setenv("BRIGHTSPACE_TZ", "Not/AZone")
+    monkeypatch.setenv("TZ", ":Asia/Tokyo")
+    assert audit_mod.local_zone().key == "Asia/Tokyo"
+
+
+def test_local_zone_defaults_to_system_or_utc(monkeypatch):
+    monkeypatch.delenv("BRIGHTSPACE_TZ", raising=False)
+    monkeypatch.delenv("TZ", raising=False)
+    monkeypatch.setattr(audit_mod.os.path, "realpath", lambda p: "/nonexistent")
+    assert audit_mod.local_zone().key == "UTC"
 
 
 def test_to_local_uses_wall_clock_not_iso_date():

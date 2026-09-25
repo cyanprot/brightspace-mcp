@@ -123,7 +123,7 @@ async def _with_auth_retry(
 
 @mcp.tool()
 async def login(ctx: Context) -> str:
-    """Refresh the Langara Brightspace session from the saved browser profile.
+    """Refresh the Brightspace session from the saved browser profile.
 
     Silent — no credentials, no MFA. Call this before using other tools if you
     get an authentication error. If the profile's SSO session is gone, this

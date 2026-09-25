@@ -23,11 +23,35 @@ from datetime import UTC, datetime
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlsplit
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .api import BrightspaceAPI, next_page, page_items
 
-LOCAL_TZ = ZoneInfo(os.environ.get("BRIGHTSPACE_TZ", "America/Vancouver"))
+
+def local_zone() -> ZoneInfo:
+    """BRIGHTSPACE_TZ, else the system zone (TZ, then /etc/localtime), else UTC.
+
+    A named IANA zone is needed, not a fixed offset: due dates months ahead must
+    get that date's offset.
+    """
+    candidates = [os.environ.get("BRIGHTSPACE_TZ"), os.environ.get("TZ", "").lstrip(":")]
+    try:
+        target = os.path.realpath("/etc/localtime")
+        if "/zoneinfo/" in target:
+            candidates.append(target.split("/zoneinfo/", 1)[1])
+    except OSError:
+        pass
+    for name in candidates:
+        if not name:
+            continue
+        try:
+            return ZoneInfo(name)
+        except (ZoneInfoNotFoundError, ValueError, OSError):
+            continue
+    return ZoneInfo("UTC")
+
+
+LOCAL_TZ = local_zone()
 
 # Files worth having locally. Code and data files count: a lab page links its
 # starter .java or .csv the same way it links a PDF handout.

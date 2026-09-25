@@ -147,3 +147,12 @@ def test_audit_course_expands_home_in_local_root(tmp_path, monkeypatch):
     out = asyncio.run(server.audit_course(1, local_root="~/courses/PHYS101", ctx=_Ctx(_app(_Api()))))
     assert out == "report"
     assert seen["root"] == tmp_path / "courses" / "PHYS101"
+
+
+def test_config_requires_brightspace_url(monkeypatch, tmp_path):
+    from brightspace_mcp.config import Config
+
+    monkeypatch.delenv("BRIGHTSPACE_URL", raising=False)
+    monkeypatch.setenv("BRIGHTSPACE_SESSION_DIR", str(tmp_path))
+    with pytest.raises(ValueError, match="BRIGHTSPACE_URL is not set"):
+        Config()

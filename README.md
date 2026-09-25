@@ -152,12 +152,12 @@ The skill will:
 
 | Environment Variable | Default | Description |
 |---------------------|---------|-------------|
-| `BRIGHTSPACE_URL` | `https://d2l.langara.bc.ca` | Your school's Brightspace URL |
+| `BRIGHTSPACE_URL` | (required) | Your school's Brightspace URL, e.g. `https://your-school.brightspace.com`. The server refuses to start without it |
 | `BRIGHTSPACE_USER` | — | Login email. Only prefills the sign-in box during the manual bootstrap |
 | `BRIGHTSPACE_HEADLESS` | `false` | Set `true` to hide the browser during the silent refresh |
 | `BRIGHTSPACE_SESSION_DIR` | `~/.local/state/brightspace-mcp/` | Cookies, downloads, and the persistent browser profile |
 | `BRIGHTSPACE_DOWNLOAD_DIR` | `~/.local/state/brightspace-mcp/downloads/` | Default download location |
-| `BRIGHTSPACE_TZ` | `America/Vancouver` | IANA timezone `audit_course` uses to render due dates and timestamps in local time |
+| `BRIGHTSPACE_TZ` | system zone (`TZ`, then `/etc/localtime`), else `UTC` | IANA timezone `audit_course` uses to render due dates and timestamps in local time, e.g. `America/Toronto` |
 
 ## Session Management
 
