@@ -65,6 +65,29 @@ def _get_app(ctx: Context) -> AppContext:
     return ctx.request_context.lifespan_context
 
 
+def _target_dir(save_dir: str | None, config: Config) -> Path:
+    """Where a download lands. `~` is expanded; a relative path is refused.
+
+    Path(save_dir) alone left "~/x" as a literal directory and dropped a relative
+    path into the server's cwd, which is this repo, not anywhere the caller meant.
+    """
+    if not save_dir:
+        return config.download_dir
+    path = Path(save_dir).expanduser()
+    if not path.is_absolute():
+        raise ValueError(f"save_dir must be an absolute path (or start with ~): {save_dir!r}")
+    return path.resolve()
+
+
+def _failed(what: str, e: Exception) -> str:
+    """'<what>: <ErrorType>: <message>' for a tool's error string.
+
+    The type is always included: a timeout's str() is empty, and "Download failed: "
+    alone said nothing about what went wrong.
+    """
+    return f"{what}: {type(e).__name__}: {e}" if str(e) else f"{what}: {type(e).__name__}"
+
+
 async def _with_auth_retry(
     app: AppContext, func: Callable[[], Coroutine[Any, Any, Any]]
 ) -> Any:
@@ -114,6 +137,8 @@ async def login(ctx: Context) -> str:
     except LoginRequiredError as e:
         return str(e)
 
+    if app.api:
+        await app.api.close()
     app.api = BrightspaceAPI(app.config, cookies)
     user = await app.api.whoami()
 
@@ -190,7 +215,7 @@ async def get_course_content(
     try:
         return await _with_auth_retry(app, _fetch)
     except Exception as e:
-        return f"Error fetching content: {e}"
+        return _failed("Error fetching content", e)
 
 
 @mcp.tool()
@@ -208,15 +233,14 @@ async def download_file(
     if not app.api:
         return "Not authenticated. Call 'login' first."
 
-    target_dir = Path(save_dir) if save_dir else app.config.download_dir
-    await ctx.info(f"Downloading topic {topic_id} to {target_dir}...")
-
     try:
+        target_dir = _target_dir(save_dir, app.config)
+        await ctx.info(f"Downloading topic {topic_id} to {target_dir}...")
         return await _with_auth_retry(
             app, lambda: app.api.download_topic_file(course_id, topic_id, target_dir)
         )
     except Exception as e:
-        return f"Download failed: {e}"
+        return _failed("Download failed", e)
 
 
 @mcp.tool()
@@ -224,6 +248,9 @@ async def get_assignment_attachments(
     course_id: int, folder_id: int, ctx: Context = None
 ) -> list[DropboxAttachment] | str:
     """List files attached to an assignment/lab dropbox folder.
+
+    A handout attached as a link comes back with file_id 0 and a link_url: fetch it
+    with download_linked_file (Brightspace paths only), not download_assignment_file.
 
     Args:
         course_id: The course org unit ID. Use get_courses to find it.
@@ -238,7 +265,7 @@ async def get_assignment_attachments(
             app, lambda: app.api.get_dropbox_attachments(course_id, folder_id)
         )
     except Exception as e:
-        return f"Error fetching attachments: {e}"
+        return _failed("Error fetching attachments", e)
 
 
 @mcp.tool()
@@ -258,15 +285,14 @@ async def download_assignment_file(
     if not app.api:
         return "Not authenticated. Call 'login' first."
 
-    target_dir = Path(save_dir) if save_dir else app.config.download_dir
-    await ctx.info(f"Downloading attachment {file_id} to {target_dir}...")
-
     try:
+        target_dir = _target_dir(save_dir, app.config)
+        await ctx.info(f"Downloading attachment {file_id} to {target_dir}...")
         return await _with_auth_retry(
             app, lambda: app.api.download_dropbox_attachment(course_id, folder_id, file_id, target_dir)
         )
     except Exception as e:
-        return f"Download failed: {e}"
+        return _failed("Download failed", e)
 
 
 @mcp.tool()
@@ -288,13 +314,13 @@ async def download_announcement_file(
     if not app.api:
         return "Not authenticated. Call 'login' first."
 
-    target_dir = Path(save_dir) if save_dir else app.config.download_dir
     try:
+        target_dir = _target_dir(save_dir, app.config)
         return await _with_auth_retry(
             app, lambda: app.api.download_news_attachment(course_id, news_id, file_id, target_dir)
         )
     except Exception as e:
-        return f"Download failed: {e}"
+        return _failed("Download failed", e)
 
 
 @mcp.tool()
@@ -316,7 +342,7 @@ async def get_grades(course_id: int, ctx: Context = None) -> list[GradeValue] | 
     try:
         return await _with_auth_retry(app, _fetch)
     except Exception as e:
-        return f"Error fetching grades: {e}"
+        return _failed("Error fetching grades", e)
 
 
 @mcp.tool()
@@ -356,7 +382,7 @@ async def get_course_overview(course_id: int, ctx: Context = None) -> dict | str
     try:
         return await _with_auth_retry(app, _fetch)
     except Exception as e:
-        return f"Error fetching overview: {e}"
+        return _failed("Error fetching overview", e)
 
 
 @mcp.tool()
@@ -373,13 +399,13 @@ async def download_course_overview(
     if not app.api:
         return "Not authenticated. Call 'login' first."
 
-    target_dir = Path(save_dir) if save_dir else app.config.download_dir
     try:
+        target_dir = _target_dir(save_dir, app.config)
         return await _with_auth_retry(
             app, lambda: app.api.download_overview_attachment(course_id, target_dir)
         )
     except Exception as e:
-        return f"Download failed: {e}"
+        return _failed("Download failed", e)
 
 
 @mcp.tool()
@@ -400,11 +426,11 @@ async def download_linked_file(
     if not app.api:
         return "Not authenticated. Call 'login' first."
 
-    target_dir = Path(save_dir) if save_dir else app.config.download_dir
     try:
+        target_dir = _target_dir(save_dir, app.config)
         return await _with_auth_retry(app, lambda: app.api.download_linked_file(url, target_dir))
     except Exception as e:
-        return f"Download failed: {e}"
+        return _failed("Download failed", e)
 
 @mcp.tool()
 async def audit_course(
@@ -427,7 +453,11 @@ async def audit_course(
     Args:
         course_id: The course org unit ID. Use get_courses to find it.
         local_root: Optional local course directory. Documents are compared against it
-            by filename, skipping `_*` (frozen previous-term) and `.*` directories.
+            by filename. `.*` directories are skipped, and so are frozen previous-term
+            trees (`_spring2026/`, `_handout/spring2026/`) and every other `_*`
+            directory except `_handout/`, which holds this term's handouts.
+            Filenames listed in `<local_root>/.syncignore` (deleted by the user) are
+            reported as ignored, not missing.
     """
     app = _get_app(ctx)
     if not app.api:
@@ -437,14 +467,14 @@ async def audit_course(
         courses = await app.api.get_enrollments()
         course_name = next((c.name for c in courses if c.id == course_id), "")
         report = await run_audit(
-            app.api, course_id, course_name, Path(local_root) if local_root else None
+            app.api, course_id, course_name, Path(local_root).expanduser() if local_root else None
         )
         return render(report)
 
     try:
         return await _with_auth_retry(app, _fetch)
     except Exception as e:
-        return f"Audit failed: {e}"
+        return _failed("Audit failed", e)
 
 
 def main() -> None:

@@ -1,4 +1,5 @@
 import asyncio
+import fcntl
 import json
 import logging
 import os
@@ -19,7 +20,6 @@ from playwright.async_api import (
 from .config import Config
 
 logger = logging.getLogger(__name__)
-logger.addHandler(logging.StreamHandler(sys.stderr))
 
 # Unattended budget. Generous, because a working silent SSO still has to walk
 # the whole SAML redirect chain. A dead session is caught by MS_STUCK_MS below
@@ -55,10 +55,12 @@ async def try_restore_session(config: Config) -> list[dict] | None:
     try:
         data = json.loads(config.storage_state_path.read_text())
         cookies = data.get("cookies", [])
-        if not cookies:
+        if not cookies or not isinstance(cookies, list):
             return None
         return cookies
-    except (json.JSONDecodeError, KeyError):
+    except (ValueError, AttributeError, TypeError, KeyError):
+        # JSONDecodeError is a ValueError. A truncated or hand-edited file (a JSON
+        # list, a string) must mean "login required", not a crash at startup.
         return None
 
 
@@ -77,6 +79,31 @@ def landed_on_home(url: str, base_url: str) -> bool:
     return parts.path == "/d2l/home" or parts.path.startswith("/d2l/home/")
 
 
+_BUSY_HINT = (
+    "is already open in another process. That could be the MCP server, a sync "
+    "script, or a stray Chromium. Only one process may use it at a time. Close "
+    "the other one and retry."
+)
+
+
+def _lock_profile(config: Config) -> int:
+    """Take an advisory lock on the profile. Returns the fd; the caller closes it.
+
+    Chromium's ProcessSingleton only guards a headful profile. Two headless
+    servers open the same profile without complaint and corrupt it, so the lock
+    is taken here, before launch, in every mode.
+    """
+    fd = os.open(config.session_dir / "profile.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        raise ProfileBusyError(
+            f"The browser profile at {config.profile_dir} {_BUSY_HINT}"
+        ) from None
+    return fd
+
+
 async def _launch(p: Playwright, config: Config, *, headless: bool) -> BrowserContext:
     """Open the persistent Chromium profile that holds the Microsoft SSO session."""
     try:
@@ -90,10 +117,7 @@ async def _launch(p: Playwright, config: Config, *, headless: bool) -> BrowserCo
         # holds. That process exits before writing, so the session stays intact.
         if "ProcessSingleton" in str(e) or "already in use" in str(e):
             raise ProfileBusyError(
-                f"The browser profile at {config.profile_dir} is already open in "
-                "another process. That could be the MCP server, a sync script, or "
-                "a stray Chromium. Only one process may use it at a time. Close "
-                "the other one and retry."
+                f"The browser profile at {config.profile_dir} {_BUSY_HINT}"
             ) from e
         raise
 
@@ -140,7 +164,22 @@ async def _await_home(
 
 
 async def _save(context: BrowserContext, config: Config) -> list[dict]:
-    await context.storage_state(path=str(config.storage_state_path))
+    """Write storage_state.json privately and atomically.
+
+    The file carries ESTSAUTHPERSISTENT and the D2L tokens. Playwright writes it
+    with the umask (0644), so it goes to a 0600 temp file in the same directory
+    first and is renamed over the final path.
+    """
+    final = config.storage_state_path
+    tmp = final.with_name(final.name + ".tmp")
+    try:
+        # Create it 0600 first: Playwright opens with "w", which keeps the mode.
+        os.close(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600))
+        os.chmod(tmp, 0o600)
+        await context.storage_state(path=str(tmp))
+        os.replace(tmp, final)
+    finally:
+        tmp.unlink(missing_ok=True)
     return await context.cookies()
 
 
@@ -154,19 +193,23 @@ async def sso_login(config: Config) -> list[dict]:
 
     Returns the list of cookies from the authenticated session.
     """
-    async with async_playwright() as p:
-        context = await _launch(p, config, headless=config.headless)
-        try:
-            page = _page_of(context) or await context.new_page()
-            logger.info("Navigating to Brightspace — profile should carry the session")
-            await page.goto(
-                f"{config.brightspace_url}/d2l/login", wait_until="domcontentloaded"
-            )
-            await _await_home(page, config, SILENT_SSO_TIMEOUT_MS, unattended=True)
-            logger.info("Silent SSO succeeded — saving session")
-            return await _save(context, config)
-        finally:
-            await context.close()
+    lock_fd = _lock_profile(config)
+    try:
+        async with async_playwright() as p:
+            context = await _launch(p, config, headless=config.headless)
+            try:
+                page = _page_of(context) or await context.new_page()
+                logger.info("Navigating to Brightspace — profile should carry the session")
+                await page.goto(
+                    f"{config.brightspace_url}/d2l/login", wait_until="domcontentloaded"
+                )
+                await _await_home(page, config, SILENT_SSO_TIMEOUT_MS, unattended=True)
+                logger.info("Silent SSO succeeded — saving session")
+                return await _save(context, config)
+            finally:
+                await context.close()
+    finally:
+        os.close(lock_fd)
 
 
 async def interactive_login(config: Config) -> list[dict]:
@@ -182,36 +225,40 @@ async def interactive_login(config: Config) -> list[dict]:
             "bare SSH session."
         )
 
-    async with async_playwright() as p:
-        context = await _launch(p, config, headless=False)
-        try:
-            page = _page_of(context) or await context.new_page()
-            await page.goto(
-                f"{config.brightspace_url}/d2l/login", wait_until="domcontentloaded"
-            )
+    lock_fd = _lock_profile(config)
+    try:
+        async with async_playwright() as p:
+            context = await _launch(p, config, headless=False)
+            try:
+                page = _page_of(context) or await context.new_page()
+                await page.goto(
+                    f"{config.brightspace_url}/d2l/login", wait_until="domcontentloaded"
+                )
 
-            # domcontentloaded fires before AAD renders its form, so wait for
-            # the field rather than probing for it once.
-            if config.username:
-                try:
-                    await page.wait_for_selector(Config.MS_EMAIL_INPUT, timeout=15_000)
-                    await page.fill(Config.MS_EMAIL_INPUT, config.username)
-                except PlaywrightTimeoutError:
-                    pass  # Already signed in, or a different sign-in screen
+                # domcontentloaded fires before AAD renders its form, so wait for
+                # the field rather than probing for it once.
+                if config.username:
+                    try:
+                        await page.wait_for_selector(Config.MS_EMAIL_INPUT, timeout=15_000)
+                        await page.fill(Config.MS_EMAIL_INPUT, config.username)
+                    except PlaywrightTimeoutError:
+                        pass  # Already signed in, or a different sign-in screen
 
-            print(
-                "Complete the login in the browser window.\n"
-                "  - enter your password\n"
-                "  - approve MFA\n"
-                '  - answer "Yes" to "Stay signed in?"\n'
-                "Waiting up to 10 minutes...",
-                file=sys.stderr,
-            )
-            await _await_home(page, config, INTERACTIVE_TIMEOUT_MS, unattended=False)
-            print("Login successful — session saved.", file=sys.stderr)
-            return await _save(context, config)
-        finally:
-            await context.close()
+                print(
+                    "Complete the login in the browser window.\n"
+                    "  - enter your password\n"
+                    "  - approve MFA\n"
+                    '  - answer "Yes" to "Stay signed in?"\n'
+                    "Waiting up to 10 minutes...",
+                    file=sys.stderr,
+                )
+                await _await_home(page, config, INTERACTIVE_TIMEOUT_MS, unattended=False)
+                print("Login successful — session saved.", file=sys.stderr)
+                return await _save(context, config)
+            finally:
+                await context.close()
+    finally:
+        os.close(lock_fd)
 
 
 def login_cli() -> None:

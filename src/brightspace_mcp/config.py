@@ -27,7 +27,8 @@ class Config:
             os.environ.get("BRIGHTSPACE_DOWNLOAD_DIR", self.session_dir / "downloads")
         )
 
-        self.session_dir.mkdir(parents=True, exist_ok=True)
+        # 0700: the directory holds the browser profile and the session cookies.
+        self.session_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
 
     @property
     def storage_state_path(self) -> Path:

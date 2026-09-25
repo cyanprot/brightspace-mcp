@@ -3,6 +3,8 @@
 import asyncio
 from types import SimpleNamespace
 
+import pytest
+
 from brightspace_mcp import server
 from brightspace_mcp.api import SessionExpiredError
 from brightspace_mcp.server import AppContext
@@ -87,6 +89,24 @@ def test_get_course_overview_without_overview():
     assert asyncio.run(server.get_course_overview(1, ctx=_Ctx(app))) == {"has_overview": False}
 
 
+def test_target_dir_expands_home_and_refuses_relative(tmp_path, monkeypatch):
+    # Path(save_dir) alone kept "~" literal and dropped a relative path into the
+    # server's cwd, which is this repo.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg = SimpleNamespace(download_dir=tmp_path / "dl")
+    assert server._target_dir(None, cfg) == tmp_path / "dl"
+    assert server._target_dir("~/x", cfg) == tmp_path / "x"
+    assert server._target_dir(str(tmp_path / "a" / ".." / "b"), cfg) == tmp_path / "b"
+    with pytest.raises(ValueError, match="absolute"):
+        server._target_dir("downloads", cfg)
+
+
+def test_download_tool_reports_bad_save_dir_as_a_string():
+    app = _app(_FakeApi())
+    out = asyncio.run(server.download_course_overview(1, save_dir="rel/dir", ctx=_Ctx(app)))
+    assert out.startswith("Download failed:") and "absolute" in out
+
+
 def test_tools_refuse_without_session():
     app = _app(None)
     for call in (server.get_course_overview(1, ctx=_Ctx(app)),
@@ -95,3 +115,35 @@ def test_tools_refuse_without_session():
                  server.download_announcement_file(1, 2, 3, ctx=_Ctx(app)),
                  server.audit_course(1, ctx=_Ctx(app))):
         assert asyncio.run(call) == "Not authenticated. Call 'login' first."
+
+
+def test_error_strings_name_the_exception_type():
+    # A timeout's str() is empty, and "Download failed: " said nothing.
+    import httpx
+
+    class _Timeout(_FakeApi):
+        async def get_overview(self, course_id):
+            raise httpx.ReadTimeout("")
+
+    out = asyncio.run(server.get_course_overview(1, ctx=_Ctx(_app(_Timeout()))))
+    assert out == "Error fetching overview: ReadTimeout"
+    assert server._failed("Download failed", ValueError("bad")) == "Download failed: ValueError: bad"
+
+
+def test_audit_course_expands_home_in_local_root(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    seen = {}
+
+    async def fake_audit(api, course_id, course_name, local_root):
+        seen["root"] = local_root
+        return "report"
+
+    class _Api(_FakeApi):
+        async def get_enrollments(self):
+            return []
+
+    monkeypatch.setattr(server, "run_audit", fake_audit)
+    monkeypatch.setattr(server, "render", lambda report: report)
+    out = asyncio.run(server.audit_course(1, local_root="~/courses/PHYS101", ctx=_Ctx(_app(_Api()))))
+    assert out == "report"
+    assert seen["root"] == tmp_path / "courses" / "PHYS101"

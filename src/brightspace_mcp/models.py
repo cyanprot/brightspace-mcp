@@ -15,6 +15,7 @@ class Assignment(BaseModel):
     due_date: str | None = None
     points: float | None = None
     instructions_snippet: str | None = None
+    is_hidden: bool = False
 
 
 class CalendarEvent(BaseModel):
@@ -52,6 +53,7 @@ class DropboxAttachment(BaseModel):
     folder_id: int
     filename: str
     size_bytes: int
+    link_url: str | None = None  # set for a link attachment (file_id 0): use download_linked_file
 
 
 class GradeValue(BaseModel):

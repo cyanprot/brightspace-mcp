@@ -25,7 +25,7 @@ from pathlib import Path
 from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlsplit
 from zoneinfo import ZoneInfo
 
-from .api import BrightspaceAPI
+from .api import BrightspaceAPI, next_page, page_items
 
 LOCAL_TZ = ZoneInfo(os.environ.get("BRIGHTSPACE_TZ", "America/Vancouver"))
 
@@ -42,6 +42,13 @@ MAX_MODULES = 300
 # Overview text at least this long is listed as an outline candidate even without a
 # keyword: a pasted outline need not contain the word "outline".
 OVERVIEW_TEXT_CANDIDATE = 800
+
+# A frozen previous-term tree, `_spring2026/` or `_handout/spring2026/`. Skipped at
+# any depth: a file that only exists in last term's tree is not present for this term.
+FROZEN_TERM_DIR_RE = re.compile(r"^_?(spring|summer|fall|winter)\d{4}$", re.IGNORECASE)
+# The one `_*` directory that holds current-term files: instructor handouts in
+# `_handout/docs/` and `_handout/demo-code/`.
+HANDOUT_DIR = "_handout"
 
 OUTLINE_RE = re.compile(r"outline|syllabus|course\s+info", re.IGNORECASE)
 # "AI" is matched case-sensitively so ordinary words ("said", "maintain") never hit.
@@ -188,17 +195,34 @@ class LocalFile:
     size: int
 
 
-def local_index(root: Path | None) -> dict[str, list[LocalFile]] | None:
-    """Lower-cased filename -> every local copy, skipping `_*` and `.*` directories.
+def skip_local_dir(name: str) -> bool:
+    """Is a local directory left out of the comparison?
 
-    `_*` skips frozen previous-term trees such as `_spring2026/`: a file that only
-    exists in last term's tree does not count as present for this term.
+    `.*` always. A frozen term dir (FROZEN_TERM_DIR_RE) at any depth. Any other `_*`
+    except `_handout`, which holds this term's handouts: skipping every `_*` hid
+    `_handout/docs/` and reported its files as missing.
+    """
+    if name.startswith(".") or FROZEN_TERM_DIR_RE.match(name):
+        return True
+    return name.startswith("_") and name != HANDOUT_DIR
+
+
+LOCAL_SKIP_RULE = (f"`.*` dirs, frozen term dirs such as `_spring2026/` and `{HANDOUT_DIR}/spring2026/`, "
+                   f"and other `_*` dirs except `{HANDOUT_DIR}/` skipped")
+
+
+def local_index(root: Path | None) -> dict[str, list[LocalFile]] | None:
+    """Lower-cased filename -> every local copy, skipping dirs per skip_local_dir.
+
+    A frozen previous-term tree (`_spring2026/`, `_handout/spring2026/`) is skipped:
+    a file that only exists in last term's tree does not count as present for this
+    term. `_handout/` itself is walked, because it holds this term's handouts.
     """
     if root is None or not root.is_dir():
         return None
     index: dict[str, list[LocalFile]] = defaultdict(list)
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if not d.startswith(("_", "."))]
+        dirnames[:] = [d for d in dirnames if not skip_local_dir(d)]
         rel = Path(dirpath).relative_to(root).parts
         parts = tuple(words(p) for p in rel)
         for f in filenames:
@@ -206,8 +230,46 @@ def local_index(root: Path | None) -> dict[str, list[LocalFile]] | None:
                 st = os.stat(os.path.join(dirpath, f))
             except OSError:
                 continue  # a dangling symlink is not a local copy
-            index[f.lower()].append(LocalFile(parts, st.st_mtime, st.st_size))
+            entry = LocalFile(parts, st.st_mtime, st.st_size)
+            index[f.lower()].append(entry)
+            # Synced HTML pages are converted to PDF and the HTML deleted
+            # (html2pdf -d), so a local X.pdf also stands for a remote X.html.
+            stem, ext = os.path.splitext(f.lower())
+            if ext == ".pdf":
+                index[stem + ".html"].append(entry)
+                index[stem + ".htm"].append(entry)
     return dict(index)
+
+
+SYNCIGNORE = ".syncignore"
+
+
+def load_ignore(root: Path | None) -> set[str]:
+    """Lower-cased filenames the user deleted on purpose, from `<root>/.syncignore`.
+
+    One filename per line, `#` starts a comment. An entry for X.pdf also covers a
+    remote X.html / X.htm, because synced HTML pages are kept as PDF.
+
+    Only a missing file means "nothing ignored". Any other read failure raises: a
+    list that exists but cannot be read must not quietly turn every file the user
+    deleted back into "missing".
+    """
+    if root is None:
+        return set()
+    try:
+        lines = (root / SYNCIGNORE).read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return set()
+    names = set()
+    for line in lines:
+        name = line.split("#", 1)[0].strip().lower()
+        if not name:
+            continue
+        names.add(name)
+        stem, ext = os.path.splitext(name)
+        if ext == ".pdf":
+            names |= {stem + ".html", stem + ".htm"}
+    return names
 
 
 def to_local(iso: str | None) -> str:
@@ -274,7 +336,12 @@ class Doc:
     modified: str = ""  # remote LastModifiedDate (content topics)
     size: int | None = None  # remote size in bytes (dropbox and announcement attachments)
     compare: bool = False  # take part in the local comparison
+    closed: str = ""  # local end date of a topic past its EndDate (its file 403s)
     note: str = ""
+
+
+def _add_note(d: Doc, text: str) -> None:
+    d.note = f"{d.note}, {text}" if d.note else text
 
 
 @dataclass
@@ -289,6 +356,8 @@ class Report:
     ai: list[tuple[str, str]] = field(default_factory=list)
     docs: list[Doc] = field(default_factory=list)
     missing_docs: list[Doc] = field(default_factory=list)
+    ignored_docs: list[Doc] = field(default_factory=list)  # missing, but listed in .syncignore
+    closed_docs: list[Doc] = field(default_factory=list)  # missing, but the topic is past its end date
     revised: list[Doc] = field(default_factory=list)
     scheduled: list[tuple[str, str, str]] = field(default_factory=list)  # iso, when, topic
     unreadable_topics: list[str] = field(default_factory=list)
@@ -302,17 +371,37 @@ class Report:
     def unknown(self) -> list[Source]:
         return [s for s in self.sources if s.status.startswith("UNKNOWN")]
 
+    def unread(self, *names: str) -> list[str]:
+        """Which of the named sources are UNKNOWN."""
+        return [s.name for s in self.unknown() if s.name in names]
+
+
+# The sources each report section is built from. When one of them is UNKNOWN, an empty
+# section means "could not tell", and it must not render as "None".
+NAV_SOURCES = ("course home page",)
+AI_SOURCES = ("overview", "content tree", "HTML pages in content", "announcements", "dropbox folders", "quizzes")
+DUE_SOURCES = ("dropbox folders", "quizzes")
+
+
+def _unread_line(names: list[str]) -> str:
+    return f"UNKNOWN (source{'s' if len(names) > 1 else ''} {', '.join(names)} unreadable)"
+
 
 def render(r: Report) -> str:
     out = [f"# Course audit: {r.course} ({r.course_id})", ""]
     ok = sum(s.status == "ok" for s in r.sources)
+    nav_unread = r.unread(*NAV_SOURCES)
+    # The navbar count sits on this line on purpose: "zero UNKNOWN" is the gate for
+    # recording anything as absent, and it must not read as "everything was read".
     out.append(
         f"Checked {r.checked_at}. {len(r.sources)} sources: {ok} with items, "
         f"{sum(s.status in ('empty', 'none') for s in r.sources)} empty, "
-        f"**{len(r.unknown())} UNKNOWN**."
+        f"**{len(r.unknown())} UNKNOWN**. "
+        + (f"**Navbar tools not read: {_unread_line(nav_unread)}.**" if nav_unread
+           else f"**{len(r.nav_unaudited)} navbar tools not read.**")
     )
     if r.local_root:
-        out.append(f"Local tree compared: `{r.local_root}` (`_*` and `.*` dirs skipped).")
+        out.append(f"Local tree compared: `{r.local_root}` ({LOCAL_SKIP_RULE}).")
     elif not any(s.name == "local tree" for s in r.sources):
         out.append("No local tree given, so no document was compared and none is listed as missing.")
     out += ["", "## Sources", "", "| Source | Status | Detail |", "|---|---|---|"]
@@ -323,8 +412,12 @@ def render(r: Report) -> str:
                 "concluded about them: " + ", ".join(s.name for s in r.unknown())]
 
     out += ["", "## Navbar tools this audit does not read", ""]
-    out.append(", ".join(r.nav_unaudited) + ". Open them in a browser if they could hold course "
-               "information." if r.nav_unaudited else "None. Every navbar tool was read.")
+    if nav_unread:
+        out.append(_unread_line(nav_unread) + ". The navbar was not read, so any tool in it may be unaudited.")
+    elif r.nav_unaudited:
+        out.append(", ".join(r.nav_unaudited) + ". Open them in a browser if they could hold course information.")
+    else:
+        out.append("None. Every navbar tool was read.")
 
     out += ["", "## Course outline candidates", ""]
     if r.outline:
@@ -340,8 +433,14 @@ def render(r: Report) -> str:
         out.append("This means \"not found by this audit\", not \"not posted\".")
 
     out += ["", "## AI mentions in HTML sources", ""]
+    ai_unread = r.unread(*AI_SOURCES)
     if r.ai:
         out += [f"- [{where}] {snip}" for where, snip in r.ai]
+        if ai_unread:
+            out.append(f"Not scanned: {_unread_line(ai_unread)}.")
+    elif ai_unread:
+        out.append(f"{_unread_line(ai_unread)}. None in the HTML that was read, which says nothing "
+                   "about the rest. PDF and DOCX files were not scanned.")
     else:
         out.append("None in any HTML source read. PDF and DOCX files were not scanned.")
 
@@ -351,9 +450,14 @@ def render(r: Report) -> str:
         out += ["", "## Gradebook setup", ""] + [f"- {g}" for g in r.grading]
 
     out += ["", f"## Due items ({LOCAL_TZ.key})", ""]
+    due_unread = r.unread(*DUE_SOURCES)
     if r.due:
         out += ["| Due | Closes | Kind | Item |", "|---|---|---|---|"]
         out += [f"| {due} | {end} | {kind} | {name} |" for _, due, end, kind, name in sorted(r.due)]
+        if due_unread:
+            out += ["", f"Incomplete: {_unread_line(due_unread)}."]
+    elif due_unread:
+        out.append(f"{_unread_line(due_unread)}.")
     else:
         out.append("None.")
 
@@ -376,6 +480,17 @@ def render(r: Report) -> str:
     if r.missing_docs:
         out += ["", "## Documents not present locally", ""]
         out += [f"- [{d.where}] {d.name}{_fetch_hint(d)}{_note(d)}" for d in r.missing_docs]
+
+    if r.closed_docs:
+        out += ["", "## Closed topics not present locally", "",
+                ("Past their end date, so the file 403s and a download fails. Not counted as missing. "
+                 "Get them from the instructor if they are needed.")]
+        out += [f"- [{d.where}] {d.name}{_note(d)}" for d in r.closed_docs]
+
+    if r.ignored_docs:
+        out += ["", f"## Ignored by {SYNCIGNORE}", "",
+                "Not present locally because the user deleted them. Do not download."]
+        out += [f"- [{d.where}] {d.name}" for d in r.ignored_docs]
 
     if r.revised:
         out += ["", "## Remote files changed after the local copy", "",
@@ -448,7 +563,7 @@ def resolve_local(docs: list[Doc], local: dict[str, list[LocalFile]] | None) -> 
             for d in group:
                 d.local = hit is not None
                 if hit is None and n_remote > 1:
-                    d.note = f"same name in {n_remote} places, {n_local} local, no local folder matches"
+                    _add_note(d, f"same name in {n_remote} places, {n_local} local, no local folder matches")
 
 
 def find_revised(docs: list[Doc], local: dict[str, list[LocalFile]] | None) -> list[Doc]:
@@ -467,10 +582,10 @@ def find_revised(docs: list[Doc], local: dict[str, list[LocalFile]] | None) -> l
         if d.modified:
             changed = datetime.fromisoformat(d.modified).timestamp()
             if changed > max(f.mtime for f in files) + 60:
-                d.note = f"remote changed {to_local(d.modified)}"
+                _add_note(d, f"remote changed {to_local(d.modified)}")
                 out.append(d)
         elif d.size and all(f.size != d.size for f in files):
-            d.note = f"remote {d.size} bytes, local {', '.join(str(f.size) for f in files)}"
+            _add_note(d, f"remote {d.size} bytes, local {', '.join(str(f.size) for f in files)}")
             out.append(d)
     return out
 
@@ -487,20 +602,31 @@ def _status(code: int, data) -> str:
 
 
 async def get_list(api: BrightspaceAPI, path: str) -> tuple[int, list]:
-    """A D2L list, following ObjectListPage `Next` links. Returns the first failing status."""
+    """A D2L list and every further page of it. Returns the first failing status.
+
+    Pages are followed by `Next` (ObjectListPage) or `PagingInfo.Bookmark`
+    (PagedResultSet). A 200 of an unrecognised shape, or a page that says there is
+    more without saying where, is -1: never an empty or quietly truncated list.
+    """
     code, data = await api.get_status_json(path)
     items: list = []
+    seen = {path}
     while code == 200:
-        if isinstance(data, list):
-            items.extend(data)
-            break
-        if not isinstance(data, dict):
+        page = page_items(data)
+        if page is None:
             return -1, items
-        items.extend(data.get("Objects") or data.get("Items") or [])
-        nxt = data.get("Next")
+        items.extend(page)
+        try:
+            nxt = next_page(path, data)
+        except ValueError:
+            return -1, items
         if not nxt:
             break
-        code, data = await api.get_status_json(nxt.replace(api.base_url, ""))
+        path = nxt.replace(api.base_url, "")
+        if path in seen:
+            return -1, items  # a Next or Bookmark that loops would never end
+        seen.add(path)
+        code, data = await api.get_status_json(path)
     return code, items
 
 
@@ -543,8 +669,11 @@ async def audit_course(
 
     host = urlsplit(api.base_url).netloc
 
-    def classify_link(where: str, label: str, full: str, context: str = "") -> None:
-        """File a resolved link as a document, an unfollowed Brightspace link, or a link out."""
+    def classify_link(where: str, label: str, full: str, context: str = "", **extra) -> None:
+        """File a resolved link as a document, an unfollowed Brightspace link, or a link out.
+
+        `extra` goes onto the Doc when the link is a document (a closed topic's date).
+        """
         parts = urlsplit(full)
         same_host = parts.netloc == host
         # urljoin leaves "a/../b" alone when href is already absolute, so normalise here.
@@ -555,7 +684,7 @@ async def audit_course(
             comparable = fname.lower().endswith(DOC_EXTENSIONS)
             add_doc(where, fname if comparable else (label or fname), outline_hint=label,
                     comparable=comparable, href=local_ref, external=not same_host,
-                    key=local_ref, context=context)
+                    key=local_ref, context=context, **extra)
         elif not same_host:
             if parts.scheme.startswith("http"):
                 r.external_links.append((where, label, local_ref))
@@ -621,7 +750,7 @@ async def audit_course(
     # Content: content/root plus modules/{id}/structure, the same walk a sync does.
     # content/toc is NOT used: it silently drops topics with a future start date and
     # topics past their end date (one course: 28 topics in toc, 36 in the structure).
-    html_topics: list[tuple[int, str, str]] = []
+    html_topics: list[tuple[int, str, str, str]] = []  # id, where, url, closed date
     tree = defaultdict(int)
     bad_modules: list[str] = []
 
@@ -632,6 +761,9 @@ async def audit_course(
         if o.get("IsHidden"):
             tree["hidden"] += 1
             return
+        # A topic's description is shown under it in the Content tool and can carry
+        # the policy text or a handout link that the file itself does not.
+        scan_html(f"{where}/{title} (description)", rich_html(o.get("Description")))
         if o.get("IsBroken"):
             tree["broken"] += 1
             r.unreadable_topics.append(f"{path}/{title} (marked broken)")
@@ -642,34 +774,39 @@ async def audit_course(
             if is_outline(title):
                 r.outline.append(Doc(where, title, note=f"not released until {to_local(start)}"))
             return
+        closed = {}
         if end and not _after(end, now):
             tree["closed"] += 1
+            # Past its end date the file 403s, so a download cannot fix "not present
+            # locally". Such a document is listed on its own, out of the missing count.
+            closed = {"closed": to_local(end), "note": f"closed {to_local(end)}"}
         if o.get("TopicType") == 3:  # link topic
             tree["link-type"] += 1
             full = urljoin(api.base_url + "/", url)
-            classify_link(where, title, full, context=module)
+            classify_link(where, title, full, context=module, **closed)
             return
         fname = url_filename(url)
         add_doc(where, fname, outline_hint=title, ref=f"download_file topic_id={tid}",
                 key=strip_query(url) or f"topic:{tid}", context=module,
-                modified=o.get("LastModifiedDate") or "")
+                modified=o.get("LastModifiedDate") or "", **closed)
         if fname.lower().endswith(HTML_EXTENSIONS):
-            html_topics.append((tid, f"{path}/{title}", url))
+            html_topics.append((tid, f"{path}/{title}", url, closed.get("closed", "")))
 
-    async def walk(module_id: int, path: str, module: str) -> None:
+    async def walk(o: dict, path: str, module: str) -> None:
         tree["modules"] += 1
         if tree["modules"] > MAX_MODULES:
             bad_modules.append(f"{path} (skipped, over {MAX_MODULES} modules)")
             return
-        code, children = await get_list(api, f"{le}/content/modules/{module_id}/structure/")
+        scan_html(f"content {path} (module description)", rich_html(o.get("Description")))
+        code, children = await get_list(api, f"{le}/content/modules/{o.get('Id')}/structure/")
         if code != 200:
             bad_modules.append(f"{path} (HTTP {code})")
             return
-        for o in children:
-            if o.get("Type") == 0:
-                await walk(o.get("Id"), f"{path}/{o.get('Title', '')}", o.get("Title", ""))
+        for child in children:
+            if child.get("Type") == 0:
+                await walk(child, f"{path}/{child.get('Title', '')}", child.get("Title", ""))
             else:
-                topic(o, path, module)
+                topic(child, path, module)
 
     code, roots = await get_list(api, f"{le}/content/root/")
     if code != 200:
@@ -677,7 +814,7 @@ async def audit_course(
     else:
         for m in roots:
             if m.get("Type", 0) == 0:
-                await walk(m.get("Id"), m.get("Title", ""), m.get("Title", ""))
+                await walk(m, m.get("Title", ""), m.get("Title", ""))
             else:
                 topic(m, "", "")
         counts = ", ".join(f"{v} {k}" for k, v in tree.items() if k not in ("topics", "modules") and v)
@@ -689,14 +826,14 @@ async def audit_course(
 
     if html_topics:
         read = failed = 0
-        for topic_id, where, page_url in html_topics[:MAX_HTML_TOPICS]:
+        for topic_id, where, page_url, closed in html_topics[:MAX_HTML_TOPICS]:
             status, html = await api.get_text(f"{le}/content/topics/{topic_id}/file")
             if status == 200:
                 read += 1
                 scan_html(where, html, urlsplit(page_url).path or "/")
             else:
                 failed += 1
-                r.unreadable_topics.append(f"{where} (HTTP {status})")
+                r.unreadable_topics.append(f"{where} (HTTP {status}" + (f", closed {closed})" if closed else ")"))
         skipped = max(0, len(html_topics) - MAX_HTML_TOPICS)
         status = "ok" if not failed and not skipped else f"UNKNOWN ({failed} unreadable, {skipped} skipped)"
         r.sources.append(Source("HTML pages in content", status,
@@ -723,6 +860,11 @@ async def audit_course(
             add_doc(where, att.get("FileName", ""), context=name, size=att.get("Size"),
                     ref=f"download_assignment_file folder_id={f.get('Id')} file_id={att.get('FileId')}",
                     key=f"dropbox:{f.get('Id')}:{att.get('FileId')}")
+        # A handout attached as a link lives in LinkAttachments, never in Attachments.
+        for link in f.get("LinkAttachments") or []:
+            if link.get("Href"):
+                classify_link(where, link.get("LinkName") or "", urljoin(api.base_url + "/", link["Href"]),
+                              context=name)
         due, end = f.get("DueDate"), (f.get("Availability") or {}).get("EndDate")
         if due or end:
             r.due.append((due or end, to_local(due), to_local(end), "dropbox", name))
@@ -734,7 +876,10 @@ async def audit_course(
         name = qz.get("Name", "").strip()
         due, end = qz.get("DueDate"), qz.get("EndDate")
         r.due.append((due or end or "", to_local(due), to_local(end), "quiz", name))
-        scan_html(f"quiz '{name}'", rich_html(qz.get("Description")))
+        # Instructions, Header and Footer are RichText too, and a quiz's rules
+        # ("no AI", "open book") tend to sit in Instructions rather than Description.
+        for key in ("Description", "Instructions", "Header", "Footer"):
+            scan_html(f"quiz '{name}' {key.lower()}", rich_html(qz.get(key)))
     r.sources.append(Source("quizzes", _status(code, quizzes), f"{len(quizzes)} quizzes"))
 
     # Gradebook. Weights only mean something in a Weighted gradebook. A Formula
@@ -783,7 +928,7 @@ async def audit_course(
     # Discussions and checklists: counted only, so an empty result is on record.
     for name, path in (("discussions", "discussions/forums/"), ("checklists", "checklists/")):
         code, objs = await get_list(api, f"{le}/{path}")
-        r.sources.append(Source(name, _status(code, objs), f"{len(objs)} items"))
+        r.sources.append(Source(name, _status(code, objs), f"{len(objs)} items, counted only, not read"))
 
     # Classlist: recognised staff roles ONLY. The raw list holds every classmate's
     # name and email, which must never leave this function.
@@ -823,6 +968,17 @@ async def audit_course(
     ]
 
     resolve_local(r.docs, local)
-    r.missing_docs = [d for d in r.docs if d.local is False]
+    ignore: set[str] = set()
+    if local is not None:
+        try:
+            ignore = load_ignore(local_root)
+        except (OSError, UnicodeDecodeError) as e:
+            r.sources.append(Source(SYNCIGNORE, f"UNKNOWN ({type(e).__name__}: {e})",
+                                    "not applied, so files the user deleted may be listed as missing"))
+    absent = [d for d in r.docs if d.local is False]
+    r.ignored_docs = [d for d in absent if d.name.lower() in ignore]
+    kept = [d for d in absent if d.name.lower() not in ignore]
+    r.closed_docs = [d for d in kept if d.closed]
+    r.missing_docs = [d for d in kept if not d.closed]
     r.revised = find_revised(r.docs, local)
     return r

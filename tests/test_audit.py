@@ -79,11 +79,29 @@ def test_ai_mentions_acronym_is_case_sensitive():
 def test_local_filenames_skips_frozen_and_hidden_dirs(tmp_path: Path):
     (tmp_path / "docs").mkdir()
     (tmp_path / "docs" / "Outline.PDF").write_text("x")
+    # Frozen previous term, in the old layout and the current one.
     (tmp_path / "_spring2026").mkdir()
     (tmp_path / "_spring2026" / "old.pdf").write_text("x")
+    (tmp_path / "_handout" / "spring2026").mkdir(parents=True)
+    (tmp_path / "_handout" / "spring2026" / "older.pdf").write_text("x")
+    (tmp_path / "_scratch").mkdir()
+    (tmp_path / "_scratch" / "tmp.pdf").write_text("x")
     (tmp_path / ".vscode").mkdir()
     (tmp_path / ".vscode" / "settings.json").write_text("{}")
-    assert set(local_index(tmp_path)) == {"outline.pdf"}
+    assert set(local_index(tmp_path)) == {"outline.pdf", "outline.html", "outline.htm"}
+
+
+def test_local_index_walks_current_term_handouts(tmp_path: Path):
+    # _handout/ holds this term's handouts. Skipping every `_*` dir reported them missing.
+    (tmp_path / "_handout" / "docs").mkdir(parents=True)
+    (tmp_path / "_handout" / "docs" / "x.pdf").write_text("x")
+    (tmp_path / "_handout" / "demo-code").mkdir()
+    (tmp_path / "_handout" / "demo-code" / "Y.java").write_text("x")
+    (tmp_path / "_handout" / "fall2025").mkdir()
+    (tmp_path / "_handout" / "fall2025" / "z.pdf").write_text("x")
+    index = local_index(tmp_path)
+    assert {"x.pdf", "y.java"} <= set(index) and "z.pdf" not in index
+    assert index["y.java"][0].parts == (("handout",), ("demo", "code"))
     assert local_index(tmp_path / "missing") is None
     assert local_index(None) is None
 
@@ -172,16 +190,21 @@ def _full_course():
     return FakeAPI(
         json_routes={
             f"{LE}/overview": (200, {"Description": {"Text": "", "Html": ""}, "HasAttachment": True}),
-            f"{LE}/content/root/": (200, [{"Type": 0, "Id": 1, "Title": "Course Outline and textbook"}]),
+            f"{LE}/content/root/": (200, [{"Type": 0, "Id": 1, "Title": "Course Outline and textbook",
+                                           "Description": {"Html": "<p>Generative AI is not allowed.</p>"}}]),
             STRUCT: (200, [
-                _topic(11, "Course Outline", "/content/enforced/1234-X/Course%20Outline5.html"),
+                _topic(11, "Course Outline", "/content/enforced/1234-X/Course%20Outline5.html",
+                       Description={"Html": '<a href="/content/enforced/1234-X/rubric.pdf">rubric</a>'}),
                 _topic(12, "Web textbook", "https://openstax.org/x", kind=3),
             ]),
             f"{LE}/news/": (200, [{"Title": "Welcome", "Body": {"Html": "<p>hi</p>"}, "Attachments": []}]),
             f"{LE}/dropbox/folders/": (200, [{"Name": "Prelab 1", "DueDate": "2026-09-15T06:59:59.000Z",
                                               "Attachments": [{"FileName": "prelab.pdf"}]}]),
             f"{LE}/quizzes/": (200, {"Objects": [{"Name": "Week 1 Quiz", "DueDate": "2026-09-10T17:00:00.000Z",
-                                                  "EndDate": "2026-09-10T17:05:00.000Z"}], "Next": None}),
+                                                  "EndDate": "2026-09-10T17:05:00.000Z",
+                                                  "Instructions": {"Text": {"Html": "<p>No ChatGPT.</p>"}},
+                                                  "Header": {"Html": '<a href="/content/enforced/1234-X/formulas.pdf">formulas</a>'},
+                                                  "Footer": {"Html": "<p>Copilot is banned.</p>"}}], "Next": None}),
             f"{LE}/grades/setup/": (200, {"GradingSystem": "Weighted"}),
             f"{LE}/grades/categories/": (200, [{"Name": "Labs", "Weight": 30.0, "Grades": [{"Id": 1}]}]),
             f"{LE}/grades/": (200, [{"Id": 1, "Name": "Lab 1", "Weight": 10}]),
@@ -227,6 +250,26 @@ def test_audit_finds_outline_everywhere_it_hides(tmp_path):
 def test_audit_scans_html_for_ai_policy():
     r = _run(_full_course())
     assert any("AI software" in snip for _, snip in r.ai)
+    # Module descriptions and quiz Instructions/Header/Footer are HTML sources too.
+    where = {w for w, _ in r.ai}
+    assert "content Course Outline and textbook (module description)" in where
+    assert "quiz 'Week 1 Quiz' instructions" in where
+    assert "quiz 'Week 1 Quiz' footer" in where
+
+
+def test_audit_follows_links_in_descriptions(tmp_path):
+    missing = {d.name: d for d in _run(_full_course(), tmp_path).missing_docs}
+    assert missing["rubric.pdf"].where == "link in content Course Outline and textbook/Course Outline (description)"
+    assert missing["formulas.pdf"].where == "link in quiz 'Week 1 Quiz' header"
+
+
+def test_summary_line_counts_unaudited_nav_tools():
+    r = _run(_full_course())
+    report = render(r)
+    assert "**0 UNKNOWN**. **2 navbar tools not read.**" in report
+    detail = {s.name: s.detail for s in r.sources}
+    assert detail["discussions"] == "0 items, counted only, not read"
+    assert detail["checklists"] == "0 items, counted only, not read"
 
 
 def test_audit_classlist_keeps_staff_only():
@@ -520,3 +563,136 @@ def test_classlist_is_an_allowlist():
                                   "large language models are out", "gen-AI use"])
 def test_ai_mentions_cover_named_tools(text):
     assert ai_mentions(text)
+
+
+def test_syncignore_keeps_user_deleted_files_out_of_missing(tmp_path):
+    # A file the user deleted on purpose must not come back as "missing" on every run.
+    (tmp_path / ".syncignore").write_text("# deleted by the user\nRUBRIC.pdf\nCourse Outline5.pdf\n\n")
+    r = _run(_full_course(), tmp_path)
+    missing = {d.name for d in r.missing_docs}
+    ignored = {d.name for d in r.ignored_docs}
+    assert "rubric.pdf" not in missing and "rubric.pdf" in ignored
+    # An entry for X.pdf also covers a remote X.html, since HTML is kept as PDF.
+    assert "Course Outline5.html" not in missing and "Course Outline5.html" in ignored
+    assert "formulas.pdf" in missing
+    text = render(r)
+    assert "Ignored by .syncignore" in text and "rubric.pdf" in text.split("Ignored by .syncignore")[1]
+
+
+def test_no_syncignore_changes_nothing(tmp_path):
+    r = _run(_full_course(), tmp_path)
+    assert r.ignored_docs == []
+    assert "rubric.pdf" in {d.name for d in r.missing_docs}
+
+
+# --- findings from the 2026-09-24 silent-failure review -------------------------
+
+
+def test_unreadable_syncignore_is_unknown_not_empty(tmp_path):
+    # Only a missing file means "nothing ignored". One that exists and cannot be
+    # read used to count as empty, and every deleted file came back as missing.
+    (tmp_path / ".syncignore").mkdir()
+    r = _run(_full_course(), tmp_path)
+    status = {s.name: s.status for s in r.sources}
+    assert status[".syncignore"].startswith("UNKNOWN (IsADirectoryError")
+    assert "**1 UNKNOWN**" in render(r)
+
+
+def test_unknown_home_page_renders_no_navbar_negative():
+    api = _full_course()
+    api.text_routes[f"/d2l/home/{OU}"] = (500, "")
+    report = render(_run(api))
+    assert "navbar tools not read.**" not in report
+    assert "Navbar tools not read: UNKNOWN (source course home page unreadable)" in report
+    assert "Every navbar tool was read" not in report
+    section = report.split("## Navbar tools this audit does not read")[1].split("##")[0]
+    assert "UNKNOWN (source course home page unreadable)" in section
+
+
+def test_unknown_due_sources_render_no_due_negative():
+    api = _full_course()
+    api.json_routes[f"{LE}/dropbox/folders/"] = (500, None)
+    api.json_routes[f"{LE}/quizzes/"] = (403, None)
+    section = render(_run(api)).split("## Due items")[1].split("##")[0]
+    assert "None." not in section
+    assert "UNKNOWN (sources dropbox folders, quizzes unreadable)" in section
+    # One source unreadable, items from the other: listed, and flagged incomplete.
+    api = _full_course()
+    api.json_routes[f"{LE}/quizzes/"] = (403, None)
+    section = render(_run(api)).split("## Due items")[1].split("##")[0]
+    assert "Prelab 1" in section and "Incomplete: UNKNOWN (source quizzes unreadable)" in section
+
+
+def test_unknown_html_sources_render_no_ai_negative():
+    api = FakeAPI(json_routes={f"{LE}/overview": (500, None)}, text_routes={f"/d2l/home/{OU}": (200, NAV)})
+    section = render(_run(api)).split("## AI mentions in HTML sources")[1].split("##")[0]
+    assert "None in any HTML source read" not in section
+    assert "UNKNOWN (sources overview, content tree, announcements, dropbox folders, quizzes unreadable)" in section
+
+
+def test_dropbox_link_attachments_are_audited(tmp_path):
+    api = _full_course()
+    api.json_routes[f"{LE}/dropbox/folders/"] = (200, [{"Id": 7, "Name": "Lab 1", "LinkAttachments": [
+        {"LinkId": 1, "LinkName": "Lab 1 handout", "Href": "/content/enforced/1234-X/lab1_handout.pdf"},
+        {"LinkId": 2, "LinkName": "Simulator", "Href": "https://phet.example.org/sim"},
+    ]}])
+    r = _run(api, tmp_path)
+    doc = next(d for d in r.missing_docs if d.name == "lab1_handout.pdf")
+    assert doc.where == "dropbox 'Lab 1'" and doc.context == "Lab 1"
+    assert doc.href == "/content/enforced/1234-X/lab1_handout.pdf"
+    assert ("dropbox 'Lab 1'", "Simulator", "https://phet.example.org/sim") in r.external_links
+
+
+def test_closed_topics_are_listed_apart_from_missing(tmp_path):
+    # Past its EndDate a topic's file 403s. Counting it as missing asked for a
+    # download that can never succeed.
+    api = _full_course()
+    api.json_routes[STRUCT][1].extend([
+        _topic(30, "Week 0 slides", "/content/enforced/1234-X/W0.pdf", EndDate="2026-09-09T06:59:00.000Z"),
+        _topic(31, "Old manual", "/content/enforced/1234-X/OldManual.pdf", kind=3,
+               EndDate="2026-09-09T06:59:00.000Z"),
+        _topic(32, "Week 1 slides", "/content/enforced/1234-X/W1.pdf", EndDate="2026-12-01T00:00:00.000Z"),
+    ])
+    r = _run(api, tmp_path)
+    missing = {d.name for d in r.missing_docs}
+    closed = {d.name: d for d in r.closed_docs}
+    assert set(closed) == {"W0.pdf", "OldManual.pdf"}
+    assert "W0.pdf" not in missing and "OldManual.pdf" not in missing and "W1.pdf" in missing
+    assert closed["W0.pdf"].note == "closed Tue 2026-09-08 23:59 PDT"
+    report = render(r)
+    section = report.split("## Closed topics not present locally")[1].split("##")[0]
+    assert "W0.pdf, closed Tue 2026-09-08 23:59 PDT" in section
+    assert "W0.pdf" not in report.split("## Documents not present locally")[1].split("##")[0]
+
+
+def test_unrecognised_list_shape_is_unknown_not_empty():
+    api = _full_course()
+    api.json_routes[f"{LE}/news/"] = (200, {"Something": []})
+    api.json_routes[f"{LE}/checklists/"] = (200, {"Objects": None})
+    status = {s.name: s.status for s in _run(api).sources}
+    assert status["announcements"] == "UNKNOWN (HTTP -1)"
+    assert status["checklists"] == "UNKNOWN (HTTP -1)"
+
+
+def test_get_list_follows_bookmark_and_next():
+    api = _full_course()
+    api.json_routes[f"{LE}/classlist/"] = (200, {
+        "PagingInfo": {"Bookmark": "b1", "HasMoreItems": True},
+        "Items": [{"DisplayName": "Teacher, Terry", "ClasslistRoleDisplayName": "Instructor"}]})
+    api.json_routes[f"{LE}/classlist/?bookmark=b1"] = (200, {
+        "PagingInfo": {"Bookmark": "b2", "HasMoreItems": False},
+        "Items": [{"DisplayName": "Helper, Hana", "ClasslistRoleDisplayName": "Teaching Assistant"}]})
+    api.json_routes[f"{LE}/news/"] = (200, {"Objects": [{"Title": "One"}], "Next": f"{BASE}/next-news"})
+    api.json_routes["/next-news"] = (200, {"Objects": [{"Title": "Two"}], "Next": None})
+    r = _run(api)
+    assert r.staff == ["Teacher, Terry (Instructor)", "Helper, Hana (Teaching Assistant)"]
+    assert {s.name: s.detail for s in r.sources}["announcements"] == "2 items"
+
+
+def test_paging_that_loops_or_has_no_bookmark_is_unknown():
+    api = _full_course()
+    api.json_routes[f"{LE}/news/"] = (200, {"Objects": [], "Next": f"{BASE}{LE}/news/"})
+    api.json_routes[f"{LE}/checklists/"] = (200, {"PagingInfo": {"HasMoreItems": True}, "Items": []})
+    status = {s.name: s.status for s in _run(api).sources}
+    assert status["announcements"] == "UNKNOWN (HTTP -1)"
+    assert status["checklists"] == "UNKNOWN (HTTP -1)"
