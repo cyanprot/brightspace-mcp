@@ -50,7 +50,7 @@ Claude Code  --stdio-->  MCP Server  --httpx-->  D2L Brightspace REST API
 ### Install
 
 ```bash
-git clone https://github.com/northprot/brightspace-mcp.git
+git clone https://github.com/cyanprot/brightspace-mcp.git
 cd brightspace-mcp
 uv sync
 uv run playwright install chromium
